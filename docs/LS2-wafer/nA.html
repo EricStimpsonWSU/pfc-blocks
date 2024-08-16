@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script
+      src="https://cdn.plot.ly/plotly-2.34.0.min.js"
+      charset="utf-8"
+    ></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.4/pako.min.js"></script>
+
+    <title>nA0</title>
+  </head>
+  <body>
+    <div id="myDiv" style="width: 100%; height: 100%"></div>
+    <script>
+      fetch("nA.zlib")
+        .then((response) => response.arrayBuffer())
+        .then((buffer) => {
+          const decompressed = pako.inflate(new Uint8Array(buffer));
+          const data = new Float64Array(decompressed.buffer);
+
+          // Process and visualize the data with Plotly.js
+          const data2D = [];
+          const size = Math.sqrt(data.length);
+          for (let i = 0; i < size; i++) {
+            data2D.push(data.slice(i * size, (i + 1) * size));
+          }
+
+          window.data2D = data2D;
+
+          const trace = {
+            z: data2D,
+            type: "heatmap",
+          };
+          const layout = {
+            title: "Heatmap of nA",
+            width: 1000,
+            height: 1000,
+          };
+          Plotly.newPlot("myDiv", [trace], layout);
+        })
+        .catch((error) => console.error("Error loading data:", error));
+    </script>
+  </body>
+</html>
