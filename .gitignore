@@ -410,3 +410,12 @@ out.*/
 # Python pycache
 __pycache__/
 .venv/
+cpp/fftw3/
+build/
+
+# Output files from test runs
+_archive/
+2025-*/
+*.npz
+island*/
+data/
