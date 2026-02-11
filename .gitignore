@@ -420,3 +420,10 @@ _archive/
 island*/
 data/
 *.png
+*.mp4
+
+# Executable binaries
+*.exe
+*.dll
+*.o
+*.a
