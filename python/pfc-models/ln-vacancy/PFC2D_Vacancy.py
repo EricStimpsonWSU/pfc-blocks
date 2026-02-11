@@ -9,12 +9,12 @@ import h5py
 class PFC2D_Vacancy_Parms:
   def __init__(self):
     self.epsilon = None                 # corresponds to temperature
-    self.a = None
+    self.a = 0.0                        # shift for logarithmic term
     self.beta = None
     self.g = None
     self.v0 = None
     self.Hln = None
-    self.Hng = None
+    self.Hng = 0.0
     self.N = None                       # number of pixels in the square region
     self.PPU = None                     # pixels per unit
     self.phi0 = None                    # the average density of the initial field
@@ -36,10 +36,23 @@ class PFC2D_Vacancy:
   def __init__(self):
     self.t = None      # elapsed time
     self.parms = PFC2D_Vacancy_Parms()
-    self.minLog = -10
-    self.phiMax = 5
+    self.minLog = -10.
+    self.minPhi = np.exp(self.minLog) - self.parms.a
+    self.phiMax = 5.0
     
   def InitParms(self):
+    # Ensure datatypes are correct on all parms
+    self.parms.epsilon = cp.float64(self.parms.epsilon)
+    self.parms.a = cp.float64(self.parms.a)
+    self.parms.beta = cp.float64(self.parms.beta)
+    self.parms.g = cp.float64(self.parms.g)
+    self.parms.v0 = cp.float64(self.parms.v0)
+    self.parms.Hln = cp.float64(self.parms.Hln)
+    self.parms.Hng = cp.float64(self.parms.Hng)
+    self.parms.phi0 = cp.float64(self.parms.phi0)
+    self.parms.eta = cp.float64(self.parms.eta)
+    self.parms.dt = cp.float64(self.parms.dt)
+
     # Set seed for reproducibility
     cp.random.seed(cp.uint64(self.parms.seed))
     
@@ -84,6 +97,22 @@ class PFC2D_Vacancy:
 
     # Create noise mask.
     self.noiseMask = cp.ones((self.ny, self.nx))
+
+    # Initialize fields
+    self.phi = cp.zeros((self.ny, self.nx), dtype=cp.float64)
+    self.phi_hat = cp.zeros((self.ny, self.nx), dtype=cp.complex128)
+    self.noise = cp.zeros((self.ny, self.nx), dtype=cp.float64)
+    self.noise_fft = cp.zeros((self.ny, self.nx), dtype=cp.complex128)
+    self.phi2 = cp.zeros((self.ny, self.nx), dtype=cp.float64)
+    self.phi3 = cp.zeros((self.ny, self.nx), dtype=cp.float64)
+    self.phivac = cp.zeros((self.ny, self.nx), dtype=cp.float64)
+    self.philn = cp.zeros((self.ny, self.nx), dtype=cp.float64)
+    #self.boundary = cp.zeros((self.ny, self.nx))
+    self.phiN = cp.zeros((self.ny, self.nx), dtype=cp.float64)
+
+    # grid / block dims
+    self.griddim = (int(np.ceil(self.nx/32)), int(np.ceil(self.ny/32)))
+    self.blockdim = (32, 32)
 
     # SetDT
     self.SetDT(self.parms.dt)
@@ -146,7 +175,7 @@ class PFC2D_Vacancy:
     return self.noise
 
   def InitFieldFlat(self, noisy = True):
-    self.phi = self.parms.phi0 * cp.ones((self.nx, self.ny))
+    self.phi = self.parms.phi0 * cp.ones((self.nx, self.ny), dtype=cp.float64)
     self.phi += self.GetEtaNoise() if noisy & (self.parms.eta != 0) else 0
     self.phi_hat = cp.fft.fft2(self.phi)
     self.phi0 = cp.fft.ifft2(self.phi_hat).real
@@ -156,9 +185,9 @@ class PFC2D_Vacancy:
     if A == None:
       A = self.parms.phi0/3
     
-    q1 = cp.array([-np.sqrt(3)*0.5, -0.5])
-    q2 = cp.array([0.0, 1.0])
-    q3 = cp.array([np.sqrt(3)*0.5, -0.5])
+    q1 = cp.array([-np.sqrt(3)*0.5, -0.5], dtype=cp.float64)
+    q2 = cp.array([0.0, 1.0], dtype=cp.float64)
+    q3 = cp.array([np.sqrt(3)*0.5, -0.5], dtype=cp.float64)
 
     self.phi = 2 * A * (cp.cos(self.r.dot(q1)/scalefactor) + cp.cos(self.r.dot(q2)/scalefactor) + cp.cos(self.r.dot(q3)/scalefactor)) + self.parms.phi0
     self.phi_hat = cp.fft.fft2(self.phi)
@@ -176,10 +205,11 @@ class PFC2D_Vacancy:
     self.phi_hat = cp.fft.fft2(self.phi)
     self.phi0 = cp.fft.ifft2(self.phi_hat).real
 
+  cp.fuse()
   def TimeStepCross(self):
     self.phi_hat = cp.fft.fft2(self.phi)
         
-    # if noise_dynamics is true, add noise to phi2 and phi3
+    # if noise_dynamics is true, calculate noise
     if self.parms.NoiseDynamicsFlag:
       self.NoiseT += 1
 
@@ -189,12 +219,15 @@ class PFC2D_Vacancy:
         else:
           self.GetEtaNoise()
 
-    self.N0_hat = self.Get_N_hat(self.phi)
+    self.N0_hat = self.Get_N_hat_RK(self.phi.copy())
+    # self.N0_hat_RK = self.Get_N_hat_RK(self.phi)
+    # return
 
     self.phi_hat0 = self.expcoeff * self.phi_hat + -self.k2 * self.expcoeff_nonlin * self.N0_hat
     self.phi0 = cp.fft.ifft2(self.phi_hat0).real
 
-    self.N1_hat = (self.Get_N_hat(self.phi0) - self.N0_hat)/self.parms.dt
+    self.N1_hat = (self.Get_N_hat_RK(self.phi0.copy()) - self.N0_hat)/self.parms.dt
+    # self.N1_hat = (self.Get_N_hat_RK(self.phi0) - self.N0_hat)/self.parms.dt
 
     phi_hat1 = self.expcoeff * self.phi_hat + -self.k2 * (self.expcoeff_nonlin * self.N0_hat + self.expcoeff_nonlin2 * self.N1_hat)
     phi1 = cp.fft.ifft2(phi_hat1).real
@@ -202,7 +235,7 @@ class PFC2D_Vacancy:
     delta_phi = phi1 - self.phi0
     if delta_phi.max() - delta_phi.min() > 0.01:
       self.phi0 = phi1
-      self.N1_hat = (self.Get_N_hat(self.phi0) - self.N0_hat)/self.parms.dt
+      self.N1_hat = (self.Get_N_hat_RK(self.phi0.copy()) - self.N0_hat)/self.parms.dt
 
       delta_phi = phi1 - self.phi0
       if delta_phi.max() - delta_phi.min() > 0.01:
@@ -224,30 +257,63 @@ class PFC2D_Vacancy:
     self.phi3 = self.parms.v0 * cp.power(phi, 3)
 
     # vacancy energy (stored as member for debugging)
-    self.vac = -6*self.parms.Hng*cp.power(phi,2)*(phi < 0) # 3 ϕ (|ϕ| - ϕ) = { -6ϕ^2 where ϕ < 0, or, 0 where ϕ > 0 }
+    self.phivac = -6*self.parms.Hng*cp.power(phi,2)*(phi < 0) # 3 ϕ (|ϕ| - ϕ) = { -6ϕ^2 where ϕ < 0, or, 0 where ϕ > 0 }
 
     # nl energy (stored as member for debugging)
-    self.ln = cp.ones_like(phi) * self.minLog
+    self.philn = cp.ones_like(phi) * self.minLog
     pos_mask = phi > -self.parms.a + cp.exp(self.minLog)
-    self.ln[pos_mask] = self.parms.Hln * cp.log(phi[pos_mask] + self.parms.a)
+    self.philn[pos_mask] = self.parms.Hln * cp.log(phi[pos_mask] + self.parms.a)
 
     if self.parms.BoundaryPotential is not None:
       _VbMax = cp.max(self.parms.BoundaryPotential)
       _x = 1 - self.parms.BoundaryPotential / _VbMax
       self.phi2 *= _x
       self.phi2 *= _x
-      self.vac *= _x
-      self.ln *= _x
+      self.phivac *= _x
+      self.philn *= _x
       self.boundary = self.parms.BoundaryPotential * (phi - self.parms.BoundaryDensity)
     else:
       self.boundary = 0
 
     # if noise_dynamics is true, add noise to phi2 and phi3
     if self.parms.NoiseDynamicsFlag:
-      return cp.fft.fft2(self.phi2 + self.phi3 + self.vac + self.ln + self.boundary) + self.noise_fft
+      return cp.fft.fft2(self.phi2 + self.phi3 + self.phivac + self.philn + self.boundary) + self.noise_fft
     
-    return cp.fft.fft2(self.phi2 + self.phi3 + self.vac + self.ln + self.boundary)
+    return cp.fft.fft2(self.phi2 + self.phi3 + self.phivac + self.philn + self.boundary)
 
+  def Get_N_hat_RK(self, phi):
+    self._getN(phi)
+    # self._getN(self)
+    # if noise_dynamics is true, add noise to phi2 and phi3
+    # if self.parms.NoiseDynamicsFlag:
+    #   return cp.fft.fft2(self.phiN) + self.noise_fft
+
+    # return cp.fft.fft2(self.phiN)
+    if self.parms.NoiseDynamicsFlag:
+      return cp.fft.fft2(self.phiN_RK) + self.noise_fft
+
+    return cp.fft.fft2(self.phiN_RK)
+  
+  # @cp.fuse()
+  # def _getN(self):
+  #   phiN_kernel_args = (self.phi.shape[0], self.phi.shape[1], self.parms.a, self.parms.g, self.parms.v0, self.parms.Hng, self.parms.Hln, self.minPhi, self.minLog, self.phi, self.phi2, self.phi3, self.phivac, self.philn, self.phiN)
+  #   phiN(self.griddim, self.blockdim, phiN_kernel_args)
+  #   return
+  # @cp.fuse()
+  def _getN(self, phi):
+    self.phi2_RK = cp.zeros_like(phi)
+    self.phi3_RK = cp.zeros_like(phi)
+    self.phivac_RK = cp.zeros_like(phi)
+    self.philog_RK = cp.zeros_like(phi)
+    self.phiN_RK = cp.zeros_like(phi)
+    # phiN_kernel_args = (self.ny, self.nx, self.parms.a, self.parms.g, self.parms.v0, self.parms.Hng, self.parms.Hln, self.minPhi, self.minLog, phi, self.phi2, self.phi3, self.phivac, self.philn, self.phiN)
+    phiN_kernel_args = (
+      self.ny, self.nx, self.parms.a, self.parms.g, self.parms.v0, self.parms.Hng, self.parms.Hln, self.minPhi, self.minLog,
+      phi, self.phi2_RK, self.phi3_RK, self.phivac_RK, self.philog_RK, self.phiN_RK)
+    # calc_phiN(self.griddim, self.blockdim, phiN_kernel_args)
+    self._calc_phiN((self.griddim, self.blockdim, phiN_kernel_args))
+    return
+  
   def CalcEnergyDensity(self):
     self.phi_hat = cp.fft.fft2(self.phi)
     self.energy_lin_phi = cp.fft.ifft2(self.linenergycoeff * self.phi_hat).real
@@ -286,27 +352,52 @@ class PFC2D_Vacancy:
                         t = self.t,
                         phi=self.phi.get())
   
-  def SPT_LocateCM(self, nxy = 10, min_distance=5, threshold_abs=0.8):
+  def SPT_LocateCM(self, phi=None, nxy=10, min_distance=5, threshold_abs=0.8, border=(0,0,0,0)):
+    if phi is None:
+      phi = self.phi
+    
+    # Tile 3x3 for repeating boundary condition
+    phi_cm = np.tile(phi, (3, 3))
+
     # Find peaks in phi
-    peaks = peak_local_max(self.phi.get(), min_distance=min_distance, threshold_abs=threshold_abs, exclude_border=False)
-    # print(f'Found {peaks.shape[0]} peaks in phi with min_distance={min_distance}, threshold_abs={threshold_abs}')
+    peaks = peak_local_max(phi_cm, min_distance=min_distance, threshold_abs=threshold_abs, exclude_border=False)
 
     # loop over peaks and locate CM
-    cm_list = np.zeros((peaks.shape[0], 3))
+    cm_list = np.zeros((peaks.shape[0], 9))
     for i, (y_peak, x_peak) in enumerate(peaks):
       # define bounding box for CM
-      x_begin, x_end = max(0, x_peak - nxy//2), min(self.phi.shape[1], x_peak + nxy//3)
-      y_begin, y_end = max(0, y_peak - nxy//2), min(self.phi.shape[0], y_peak + nxy//2)
+      x_begin, x_end = max(0, x_peak - nxy//2), min(phi_cm.shape[1], x_peak + nxy//2)
+      y_begin, y_end = max(0, y_peak - nxy//2), min(phi_cm.shape[0], y_peak + nxy//2)
 
       # extract region
-      region = self.phi[y_begin:y_end, x_begin:x_end].get()
+      region = phi_cm[y_begin:y_end, x_begin:x_end]
       mass = region.sum()
 
       # compute center of mass
       cm_y, cm_x = center_of_mass(region)
-      cm_list[i] = [y_begin + cm_y, x_begin + cm_x, mass]
+      px_x = x_begin - self.nx + cm_x
+      px_y = y_begin - self.ny + cm_y
+      cm_x = (px_x) * self.dx
+      cm_y = (px_y) * self.dy
+      cm_list[i] = [cm_y, cm_x, px_y, px_x, x_begin, x_end, y_begin, y_end, mass]
+    
+    # filter out CMs in border region
+    # mask = (
+    #   (cm_list[:,1] < self.dy * (self.ny - 1) - border[0]) &
+    #   (cm_list[:,1] > border[2]) &
+    #   (cm_list[:,0] < self.dx * (self.nx - 1) - border[1]) &
+    #   (cm_list[:,0] > border[3])
+    # )
+    mask = (
+      (cm_list[:,2] < self.ny - 1) &
+      (cm_list[:,2] > 0) &
+      (cm_list[:,3] < self.nx - 1) &
+      (cm_list[:,3] > 0)
+    )
+    # mask = True
 
-    return cm_list
+    print(f'Found {cm_list[mask].shape[0]} peaks in phi with min_distance={min_distance}, threshold_abs={threshold_abs}')
+    return cm_list[mask], mask, peaks
 
   def SPT_AppendData(self, cm_list, filename):
     # Append current t to cm_list
@@ -315,7 +406,44 @@ class PFC2D_Vacancy:
     # Append data to file
     with h5py.File(filename, 'a') as f:
       if 'cm' not in f:
-        f.create_dataset('cm', data=cm_list, maxshape=(None, 4), dtype='float32') #chunks=True)
+        f.create_dataset('cm', data=cm_list, maxshape=(None, cm_list.shape[1]), dtype='float32') #chunks=True)
       else:
-        f['cm'].resize((f['cm'].shape[0] + cm_list.shape[0], 4))
+        f['cm'].resize((f['cm'].shape[0] + cm_list.shape[0], cm_list.shape[1]))
         f['cm'][-cm_list.shape[0]:] = cm_list
+
+  def _calc_phiN(self, args):
+    calc_phiN(*args)
+
+calc_phiN = cp.RawKernel("""
+#include <cupy/complex.cuh>
+
+extern "C" __global__
+
+void calc_phiN(
+        int height, int width, const double a, const double g, const double v0,
+        const double hNG, const double hLN, const double minPhi, const double minLog,
+        const double* phi, double* phi2, double* phi3, double* phivac, double* philn, double* phiN) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int index = y * width + x;
+    
+    if (x < width && y < height) {
+        phi2[index] = phi[index] * phi[index];
+        phi3[index] = phi2[index] * phi[index];
+        
+        if (phi[index] < 0) {
+            phivac[index] = -6 * hNG * phi2[index];
+        } else {
+            phivac[index] = 0;
+        }
+        
+        if (phi[index] < minPhi) {
+            philn[index] = hLN * minLog;
+        } else {
+            philn[index] = hLN * log(phi[index] + a);
+        }
+
+        phiN[index] = g * phi2[index] + v0 * phi3[index] + phivac[index] + philn[index];
+    }
+}
+""", 'calc_phiN')
