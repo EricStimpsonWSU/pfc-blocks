@@ -419,3 +419,4 @@ _archive/
 *.npz
 island*/
 data/
+*.png
