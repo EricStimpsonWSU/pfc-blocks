@@ -1,0 +1,40 @@
+<canvas id="pendulumCanvas" width="400" height="300"></canvas>
+<button onclick="startAnimation()">Start</button>
+<button onclick="pauseAnimation()">Pause</button>
+
+<script>
+let canvas = document.getElementById("pendulumCanvas");
+let ctx = canvas.getContext("2d");
+let playing = false;
+let time = 0;
+
+function drawPendulum(x, y) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    let originX = canvas.width / 2, originY = 50;
+    ctx.beginPath();
+    ctx.moveTo(originX, originY);
+    ctx.lineTo(originX + x * 100, originY + y * 100);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(originX + x * 100, originY + y * 100, 10, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function update() {
+    if (!playing) return;
+    fetch('http://127.0.0.1:5000/calculate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ time: time })
+    })
+    .then(response => response.json())
+    .then(data => {
+        drawPendulum(data.x, data.y);
+        time += 0.05;
+        requestAnimationFrame(update);
+    });
+}
+
+function startAnimation() { playing = true; update(); }
+function pauseAnimation() { playing = false; }
+</script>
