@@ -1,0 +1,21 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build FFTWProject",
+            "type": "shell",
+            "command": "g++",
+            "args": [
+                "-g",
+                "-o",
+                "out/main.exe",
+                "main.cpp",
+                "-Llibs",
+                "-lfftw3",
+                "-I."
+            ],
+            "group": "build",
+            "problemMatcher": []
+        }
+    ]
+}

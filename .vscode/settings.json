@@ -13,5 +13,7 @@
   "fortran.fortls.extraArgs": ["--debug_log"],
   "files.associations": {
     "complex.h": "c"
-  }
+},
+"cmake.sourceDirectory": "D:/GitHubWSU/pfc-blocks/cpp/helloffft",
+"git.ignoreLimitWarning": true
 }
