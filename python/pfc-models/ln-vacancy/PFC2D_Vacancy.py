@@ -20,7 +20,7 @@ class PFC2D_Vacancy_Parms:
     self.phi0 = None                    # the average density of the initial field
     self.eta = None                     # the strength of the gaussian noise added to each time step
     self.dt = None                      # time step
-    self.seed = 0                       # set for reproducibility
+    self.seed = None                    # set for reproducibility
     self.NoiseDynamicsFlag = False      # set to True to add noise to the dynamics
     self.Noise_CutoffK = 0.5            # high frequency threshold for noise
     self.NoiseTimeSmoothFlag = False
@@ -37,7 +37,6 @@ class PFC2D_Vacancy:
     self.t = None      # elapsed time
     self.parms = PFC2D_Vacancy_Parms()
     self.minLog = -10.
-    self.minPhi = np.exp(self.minLog) - self.parms.a
     self.phiMax = 5.0
     
   def InitParms(self):
@@ -53,8 +52,14 @@ class PFC2D_Vacancy:
     self.parms.eta = cp.float64(self.parms.eta)
     self.parms.dt = cp.float64(self.parms.dt)
 
+    self.minLog = cp.float64(self.minLog)
+    self.minPhi = np.exp(self.minLog) - self.parms.a
+    
     # Set seed for reproducibility
-    cp.random.seed(cp.uint64(self.parms.seed))
+    if self.parms.seed is not None:
+      cp.random.seed(cp.uint64(self.parms.seed))
+    else:
+      cp.random.seed(None)
     
     # Initialize geometry
     self.SetGeometry(self.parms.N, self.parms.N, self.parms.PPU, 1)
@@ -352,52 +357,43 @@ class PFC2D_Vacancy:
                         t = self.t,
                         phi=self.phi.get())
   
-  def SPT_LocateCM(self, phi=None, nxy=10, min_distance=5, threshold_abs=0.8, border=(0,0,0,0)):
+  def SPT_LocateCM(self, phi=None, nxy=10, min_distance=5, threshold_abs=0.8):
     if phi is None:
       phi = self.phi
-    
-    # Tile 3x3 for repeating boundary condition
-    phi_cm = np.tile(phi, (3, 3))
 
-    # Find peaks in phi
-    peaks = peak_local_max(phi_cm, min_distance=min_distance, threshold_abs=threshold_abs, exclude_border=False)
+    # tile the phi field to avoid edge effects in peak finding
+    _phiTile = np.tile(phi, (3,3))
+
+    # find peaks in the tiled phi field
+    _peaks = peak_local_max(_phiTile, min_distance=int(min_distance), threshold_abs=phi.max()*threshold_abs)
 
     # loop over peaks and locate CM
-    cm_list = np.zeros((peaks.shape[0], 9))
-    for i, (y_peak, x_peak) in enumerate(peaks):
+    _cmTileList = np.zeros((_peaks.shape[0], 9))
+    for i, (y_peak, x_peak) in enumerate(_peaks):
       # define bounding box for CM
-      x_begin, x_end = max(0, x_peak - nxy//2), min(phi_cm.shape[1], x_peak + nxy//2)
-      y_begin, y_end = max(0, y_peak - nxy//2), min(phi_cm.shape[0], y_peak + nxy//2)
+      _xB, _xE = max(0, x_peak - nxy//2), min(_phiTile.shape[1], x_peak + nxy//2)
+      _yB, _yE = max(0, y_peak - nxy//2), min(_phiTile.shape[0], y_peak + nxy//2)
 
       # extract region
-      region = phi_cm[y_begin:y_end, x_begin:x_end]
-      mass = region.sum()
+      _region = _phiTile[_yB:_yE, _xB:_xE]
+      _mass = _region.sum()
 
       # compute center of mass
-      cm_y, cm_x = center_of_mass(region)
-      px_x = x_begin - self.nx + cm_x
-      px_y = y_begin - self.ny + cm_y
-      cm_x = (px_x) * self.dx
-      cm_y = (px_y) * self.dy
-      cm_list[i] = [cm_y, cm_x, px_y, px_x, x_begin, x_end, y_begin, y_end, mass]
+      _yCM, _xCM = center_of_mass(_region)
+      _xCMpx = _xB - self.nx + _xCM
+      _yCMpx = _yB - self.ny + _yCM
+      _xCM = (_xCMpx) * self.dx
+      _yCM = (_yCMpx) * self.dy
+      _cmTileList[i] = [_yCM, _xCM, _yCMpx, _xCMpx, _xB, _xE, _yB, _yE, _mass]
     
-    # filter out CMs in border region
-    # mask = (
-    #   (cm_list[:,1] < self.dy * (self.ny - 1) - border[0]) &
-    #   (cm_list[:,1] > border[2]) &
-    #   (cm_list[:,0] < self.dx * (self.nx - 1) - border[1]) &
-    #   (cm_list[:,0] > border[3])
-    # )
+    # filter CMs to those in original phi region
     mask = (
-      (cm_list[:,2] < self.ny - 1) &
-      (cm_list[:,2] > 0) &
-      (cm_list[:,3] < self.nx - 1) &
-      (cm_list[:,3] > 0)
+      (_cmTileList[:,1] >= 0) & (_cmTileList[:,1] < self.nx * self.dx) &
+      (_cmTileList[:,0] >= 0) & (_cmTileList[:,0] < self.ny * self.dy)
     )
-    # mask = True
 
-    print(f'Found {cm_list[mask].shape[0]} peaks in phi with min_distance={min_distance}, threshold_abs={threshold_abs}')
-    return cm_list[mask], mask, peaks
+    # print(f'Found {_cmTileList[mask].shape[0]} peaks in phi with min_distance={min_distance}, threshold_abs={threshold_abs}')
+    return _cmTileList[mask], mask, _peaks
 
   def SPT_AppendData(self, cm_list, filename):
     # Append current t to cm_list
