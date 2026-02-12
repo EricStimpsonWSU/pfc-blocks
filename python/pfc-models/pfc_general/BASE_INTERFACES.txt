@@ -1,0 +1,509 @@
+Base Interfaces for PFC General Library
+
+Overview
+This document sketches the concrete interface signatures for the core abstractions
+in the PFC General refactor. Each interface defines the contract between layers
+and the minimal set of methods/properties required for assembly and execution.
+
+================================================================================
+1. PFCModel (models/base_model.py)
+================================================================================
+
+Purpose:
+  Defines free energy expression and its functional derivatives for one or more
+  density fields. Model is pure: no domain/time/IO logic.
+
+Interface Sketch:
+
+  class PFCModel(ABC):
+    """Abstract base class for phase field crystal models."""
+
+    @property
+    def num_fields(self) -> int:
+      """Number of density fields (1 for single-field, >1 for multi-field)."""
+
+    @property
+    def field_shape(self) -> tuple:
+      """Shape of a single field in (nx, ny, nz, ...) format. Set by domain."""
+
+    @abstractmethod
+    def functional_derivative(self, fields: dict, mode_data: dict = None) -> dict:
+      """
+      Compute functional derivatives (d energy / d field).
+
+      Args:
+        fields: dict mapping field names to n-d arrays (e.g., {'phi': phi_array})
+        mode_data: dict with precomputed mode info if needed (single/multi-mode)
+
+      Returns:
+        dict mapping field names to functional derivative arrays (same shape/dtype)
+      """
+
+    @abstractmethod
+    def free_energy(self, fields: dict, mode_data: dict = None) -> float:
+      """
+      Compute total free energy.
+
+      Args:
+        fields: dict mapping field names to n-d arrays
+        mode_data: dict with precomputed mode info if needed
+
+      Returns:
+        scalar free energy value
+      """
+
+    def set_field_shape(self, shape: tuple) -> None:
+      """Called by simulation to inform model of spatial grid dimensions."""
+      self.field_shape = shape
+
+    def configure(self, config: dict) -> None:
+      """
+      Accept configuration dictionary (e.g., parameters like temperature, etc.).
+      Subclasses override to extract and store model parameters.
+      """
+      pass
+
+
+Notes:
+  - Model does not perform FFT or finite difference (FD) directly; those are
+    handled by Operators and Dynamics layers.
+  - Functional derivatives and free energy are computed in real space.
+  - Single-field models have one entry in fields dict; multi-field have multiple.
+  - mode_data is optional, used for amplitude models (single-mode or multi-mode).
+  - Model assumes field_shape is set before functional_derivative or free_energy
+    are called.
+
+
+================================================================================
+2. Dynamics (dynamics/base_dynamics.py)
+================================================================================
+
+Purpose:
+  Defines time evolution equations (first-order: d/dt, second-order: d2/dt2 + d/dt).
+  Dynamics is pure: no FFT/FD details beyond calling Operators.
+
+Interface Sketch:
+
+  class Dynamics(ABC):
+    """Abstract base class for dynamics (time evolution)."""
+
+    @property
+    def order(self) -> int:
+      """1 for first-order (d/dt), 2 for second-order (d2/dt2 + d/dt)."""
+
+    @abstractmethod
+    def compute_fields_next(self, fields: dict, dt: float, operators: 'Operators',
+                            model: 'PFCModel', noise_fn=None) -> dict:
+      """
+      Compute field values at next timestep (fields -> fields_next).
+
+      Args:
+        fields: dict mapping field names to current field arrays
+        dt: timestep size
+        operators: Operators instance (provides Laplacian, etc.)
+        model: PFCModel instance (provides functional_derivative, etc.)
+        noise_fn: optional callable for noise (amplitude, dtype, shape)
+
+      Returns:
+        dict mapping field names to updated field arrays (same dtype/shape)
+
+      Example for first-order: fields_next = fields + dt * L(fields) + dt * N(fields) + noise
+        where L is linear (spectral or FD), N is nonlinear, noise is optional.
+      """
+
+    @abstractmethod
+    def compute_fields_velocity(self, fields: dict, operators: 'Operators',
+                                model: 'PFCModel') -> dict:
+      """
+      Compute velocity (d fields / dt) at current state (used for output/diagnostics).
+
+      Args:
+        fields: dict mapping field names to current field arrays
+        operators: Operators instance
+        model: PFCModel instance
+
+      Returns:
+        dict mapping field names to velocity arrays (same dtype/shape as fields)
+      """
+
+    def configure(self, config: dict) -> None:
+      """Accept configuration dictionary (e.g., noise amplitude, friction, etc.)."""
+      pass
+
+
+Notes:
+  - Dynamics knows how to assemble time evolution (linear + nonlinear terms)
+    but delegates spatial operations to Operators and Operators delegates
+    physics (functional derivatives) to Model.
+  - First-order example: phi_new = phi + dt * (L(phi) + N(phi)) + noise
+  - Second-order example: store velocity; phi_new = phi + dt*v + ...; v_new = ...
+  - noise_fn is optional, provided by backend or simulation layer.
+  - For critical performance paths, custom kernels (numba or cupy) can be developed
+    that combine model derivatives, dynamics, and operators into a single fused kernel.
+    See Custom Kernel Strategy section below.
+
+
+================================================================================
+3. Operators (operators/base_ops.py)
+================================================================================
+
+Purpose:
+  Provides spatial differential operations (Laplacian, gradient, etc.) in either
+  spectral (FFT) or finite-difference (FD) form. Abstracts away numerical method.
+
+Interface Sketch:
+
+  class Operators(ABC):
+    """Abstract base class for spatial differential operators."""
+
+    @property
+    def method(self) -> str:
+      """'spectral' or 'finite_difference' or hybrid identifier."""
+
+    @property
+    def laplacian_kernel(self) -> callable or tuple:
+      """
+      For spectral: pre-computed k-space kernel (1D/2D/3D).
+      For FD: tuple of stencil arrays (for different dimensions).
+      """
+
+    @abstractmethod
+    def laplacian(self, field: np.ndarray) -> np.ndarray:
+      """
+      Compute Laplacian of field (del^2 field).
+
+      Args:
+        field: n-d array (dtype float or complex)
+
+      Returns:
+        Laplacian as n-d array (same dtype/shape)
+      """
+
+    @abstractmethod
+    def bilaplacian(self, field: np.ndarray) -> np.ndarray:
+      """
+      Compute bilaplacian of field (del^4 field).
+
+      Args:
+        field: n-d array
+
+      Returns:
+        Bilaplacian as n-d array (same dtype/shape)
+      """
+
+    @abstractmethod
+    def gradient(self, field: np.ndarray, axis: int) -> np.ndarray:
+      """
+      Compute gradient along axis (d/dx_axis).
+
+      Args:
+        field: n-d array
+        axis: direction (0=x, 1=y, 2=z, ...)
+
+      Returns:
+        Gradient as n-d array (same dtype/shape)
+      """
+
+    def configure(self, config: dict) -> None:
+      """
+      Accept configuration (domain shape, boundary conditions, etc.).
+      Pre-compute kernels/stencils if needed.
+      """
+      pass
+
+
+Notes:
+  - Spectral method applies FFT, multiplies by k-space kernel, applies inverse FFT.
+  - FD method applies stencil convolutions (or custom compiled kernels).
+  - Both methods return results in real space (not Fourier space).
+  - BC (periodic, Dirichlet, Neumann, etc.) is encoded in the method (spectral
+    assumes periodic; FD has configurable BC).
+  - For higher-order (bilaplacian), apply laplacian twice or use composite kernel.
+  - Operators preserves dtype (float or complex) and layout.
+
+
+================================================================================
+4. Backend (backends/cpu_numba/timestep.py or backends/gpu_kernels/timestep.py)
+================================================================================
+
+Purpose:
+  Executes time evolution kernels. Owns data layout, dtype, memory, and performance.
+  Presents a unified interface to Simulation despite internal CPU/GPU differences.
+
+Interface Sketch:
+
+  class Backend(ABC):
+    """Abstract base class for computational backends (CPU/GPU)."""
+
+    @property
+    def device(self) -> str:
+      """'cpu' or 'gpu' identifier."""
+
+    @abstractmethod
+    def initialize_fields(self, domain: 'Domain', initial_conditions_fn) -> dict:
+      """
+      Initialize fields on device.
+
+      Args:
+        domain: Domain instance (shape, dtype, etc.)
+        initial_conditions_fn: callable that returns {field_name: array}
+
+      Returns:
+        dict mapping field names to device arrays (backend's internal layout/dtype)
+      """
+
+    @abstractmethod
+    def timestep(self, fields: dict, dt: float, model: 'PFCModel',
+                 dynamics: 'Dynamics', operators: 'Operators',
+                 noise_amplitude: float = 0.0) -> dict:
+      """
+      Perform one timestep on device.
+
+      Args:
+        fields: dict of device arrays (current state)
+        dt: timestep size
+        model: PFCModel instance
+        dynamics: Dynamics instance
+        operators: Operators instance (pre-configured for device)
+        noise_amplitude: scalar noise level
+
+      Returns:
+        dict of device arrays (updated state)
+
+      Note: For GPU, this may involve cupy/pycuda arrays or similar.
+      """
+
+    @abstractmethod
+    def to_numpy(self, fields: dict) -> dict:
+      """Transfer fields from device to CPU as numpy arrays for I/O."""
+
+    @abstractmethod
+    def from_numpy(self, fields_np: dict) -> dict:
+      """Transfer fields from numpy (CPU) to device."""
+
+    def configure(self, config: dict) -> None:
+      """Accept backend-specific settings (thread count, memory limits, etc.)."""
+      pass
+
+
+Notes:
+  - Backend hides CPU vs GPU differences from Simulation.
+  - For CPU: fields are numpy arrays in main memory, possibly with Numba JIT kernels.
+  - For GPU: fields are gpu arrays (cupy, torch, etc.) in device memory.
+  - timestep method orchestrates model/dynamics/operators/noise on the device.
+  - Backend may pre-compile custom kernels or invoke operator kernels dynamically.
+  - See Custom Kernel Strategy section for performance optimization patterns.
+
+
+================================================================================
+5. Domain (simulation/domain.py)
+================================================================================
+
+Purpose:
+  Encapsulates spatial grid, geometry, and boundary conditions (BCs).
+  Does NOT hold field data; just metadata.
+
+Interface Sketch:
+
+  class Domain:
+    """Spatial domain configuration."""
+
+    def __init__(self, shape: tuple, box_size: tuple, dtype=np.float64,
+                 bc: str = 'periodic'):
+      """
+      Args:
+        shape: tuple (nx,) or (nx, ny) or (nx, ny, nz) for 1D/2D/3D
+        box_size: tuple (Lx,) or (Lx, Ly) or (Lx, Ly, Lz) physical size
+        dtype: numpy dtype for field arrays
+        bc: 'periodic' or 'finite_difference' or custom variant
+      """
+
+    @property
+    def ndim(self) -> int:
+      """Number of spatial dimensions (1, 2, or 3)."""
+
+    @property
+    def shape(self) -> tuple:
+      """Grid shape (nx,) or (nx, ny) or (nx, ny, nz)."""
+
+    @property
+    def box_size(self) -> tuple:
+      """Physical domain size (Lx,) or (Lx, Ly) or (Lx, Ly, Lz)."""
+
+    @property
+    def spacing(self) -> tuple:
+      """Grid spacing (dx,) or (dx, dy) or (dx, dy, dz)."""
+
+    @property
+    def dtype(self) -> type:
+      """Data type for fields (numpy dtype)."""
+
+    def get_wavenumbers(self) -> tuple or np.ndarray:
+      """
+      Return k-space wavenumbers (for spectral methods).
+      For 1D: kx array; for 2D: (kx, ky); for 3D: (kx, ky, kz).
+      """
+
+    def get_coordinates(self) -> tuple or np.ndarray:
+      """
+      Return real-space coordinates.
+      For 1D: x array; for 2D: (x, y); for 3D: (x, y, z).
+      """
+
+
+Notes:
+  - Domain is configuration, not state; it does not change during simulation.
+  - BC informs choice of Operators (spectral for periodic, FD for others).
+  - spacing is computed from shape and box_size.
+  - wavenumbers and coordinates are cached and returned on demand.
+
+
+================================================================================
+6. Simulation (simulation/runner.py)
+================================================================================
+
+Purpose:
+  Orchestrates time loop. Creates/manages Domain, InitialConditions, Backend,
+  Operators, Model, Dynamics, and outputs. No numerical computations.
+
+Interface Sketch:
+
+  class Simulation:
+    """Main simulation orchestrator."""
+
+    def __init__(self, domain: Domain, model: PFCModel, dynamics: Dynamics,
+                 backend: Backend, operators: Operators,
+                 initial_conditions: 'InitialConditions'):
+      """Wire up all components."""
+
+    def run(self, num_steps: int, dt: float, checkpoint_interval: int = 100,
+            output_fn=None, progress_fn=None) -> None:
+      """
+      Run simulation for num_steps timesteps.
+
+      Args:
+        num_steps: number of timesteps
+        dt: timestep size (may be adaptive)
+        checkpoint_interval: save checkpoint every N steps (0 = no checkpoints)
+        output_fn: optional callable(step, fields, time) for custom output
+        progress_fn: optional callable(step, time, energy, ...) for diagnostics
+
+      The loop is:
+        for step in range(num_steps):
+          fields = backend.timestep(fields, dt, ...)
+          compute diagnostics (energy, etc.)
+          if step % checkpoint_interval == 0: save checkpoint
+          if output_fn: output_fn(step, fields, step*dt)
+          if progress_fn: progress_fn(step, step*dt, energy, ...)
+      """
+
+    def load_checkpoint(self, filename: str) -> None:
+      """Restore fields and metadata from checkpoint."""
+
+    def save_checkpoint(self, filename: str, step: int, time: float) -> None:
+      """Save current fields and metadata to checkpoint."""
+
+
+Notes:
+  - Simulation is the top-level driver; users interact primarily with Simulation.
+  - Once components are wired, Simulation's job is to call backend.timestep in a loop.
+  - Diagnostics (energy decay, etc.) computed for progress tracking and validation.
+  - Checkpoints allow restart and long runs.
+
+
+================================================================================
+7. InitialConditions (simulation/initial_conditions.py)
+================================================================================
+
+Purpose:
+  Generates initial field configurations.
+
+Interface Sketch:
+
+  class InitialConditions(ABC):
+    """Abstract base for initial condition generators."""
+
+    @abstractmethod
+    def __call__(self, domain: Domain) -> dict:
+      """
+      Generate initial fields.
+
+      Args:
+        domain: Domain instance (shape, spacing, etc.)
+
+      Returns:
+        dict mapping field names to n-d arrays (initialized to domain shape)
+      """
+
+
+Notes:
+  - Subclasses implement specific IC strategies (uniform, random, loaded, etc.).
+  - IC is called once at simulation start.
+
+
+================================================================================
+Assembly Example
+================================================================================
+
+# Pseudocode showing how components fit together
+
+domain = Domain(shape=(256, 256), box_size=(100.0, 100.0), bc='periodic')
+model = LogPFCModel(parameters=...)
+dynamics = FirstOrderDynamics(noise_amplitude=0.01)
+backend = CPUNumbaBackend()
+operators = SpectralOperators()
+ic = RandomInitialCondition(seed=42)
+
+operators.configure({'domain': domain})
+model.set_field_shape(domain.shape)
+
+sim = Simulation(domain=domain, model=model, dynamics=dynamics,
+                 backend=backend, operators=operators,
+                 initial_conditions=ic)
+
+sim.run(num_steps=10000, dt=0.01, checkpoint_interval=100)
+
+
+================================================================================
+8. Custom Kernel Strategy (backends/cpu_numba/ or backends/gpu_kernels/)
+================================================================================
+
+Purpose:
+  For specific PFC models where performance is critical, develop custom fused kernels
+  that combine model derivatives, dynamics, and operators into a single optimized
+  computation. This bypasses the generalized Model/Dynamics/Operators abstraction
+  for maximum performance.
+
+Strategy:
+  1. Develop a generalized simulation first (using PFCModel, Dynamics, Operators).
+  2. Profile on target hardware (CPU or GPU).
+  3. For bottleneck PFC models, write custom kernels that:
+     - Compute model derivatives directly (without Model.functional_derivative calls)
+     - Apply Laplacian directly (spectral FFT or FD stencil)
+     - Integrate dynamics timestep in a single fused loop
+     - Handle noise internally if needed
+  4. Custom kernel signature matches Backend.timestep interface, allowing drop-in
+     replacement without changing Simulation code.
+  5. Maintain separate code paths: generic and custom, selectable at runtime.
+
+Example:
+  # Generic path (always available)
+  fields_next = backend.timestep(fields, dt, model, dynamics, operators)
+
+  # Custom optimized kernel for LogPFCModel2D (if performance-critical)
+  # Backend detects model type and selects optimized kernel
+  if isinstance(model, LogPFCModel2D) and 'optimized_kernel' in backend.config:
+    fields_next = backend.custom_timestep_logpfc2d(fields, dt, ...)
+  else:
+    fields_next = backend.timestep(fields, dt, model, dynamics, operators)
+
+Benefits:
+  - Generalized path remains clean and extensible.
+  - Custom kernels exploit hardware-specific optimizations (vectorization, memory layout).
+  - Performance gains justified for widely-used models.
+  - Code duplication is localized to performance-critical kernels.
+
+Constraints:
+  - Custom kernels must maintain same numerical results as generic path (or document differences).
+  - Easier to test correctness in generic path; custom kernel testing requires regression suite.
+  - Custom kernel development only warranted when profiling reveals a real bottleneck.

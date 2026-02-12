@@ -1,0 +1,116 @@
+PFC General Refactor Plan
+
+Goal
+- Refactor PFC2D_Vacancy and PFC2D_VaquancyMQ_CPU into a general PFC library.
+- Separate model definition, dynamics, and simulation concerns.
+- Support phase field crystal (PFC) models with clear separation of responsibilities.
+- Support central processing unit (CPU) (Numba, optional OpenMP) and graphics processing unit (GPU) (custom kernels), with focus on optimal timestep.
+- Support 1D/2D/3D fields and configurable periodic boundaries (spectral or finite-difference Laplacians).
+
+Target Layout (python/pfc-models/pfc-general)
+- models/
+  - base_model.py (abstract PFCModel)
+  - free_energy/
+    - standard.py, log.py
+  - variants/
+    - full_field.py, amplitude.py
+    - single_field.py, multi_field.py
+    - single_mode.py, multi_mode.py
+- dynamics/
+  - base_dynamics.py (abstract Dynamics)
+  - first_order.py
+  - second_order.py (placeholder for future)
+  - noise.py
+  - advection.py (placeholder for future)
+- operators/
+  - base_ops.py (common operator interface)
+  - spectral_ops.py (fast Fourier transform (FFT)-based Laplacian)
+  - fd_ops.py (finite difference (FD) Laplacian, configurable boundary conditions (BCs))
+- backends/
+  - cpu_numba/
+    - kernels.py
+    - timestep.py
+  - gpu_kernels/
+    - kernels.py
+    - timestep.py
+- simulation/
+  - domain.py (grid/geometry, dimension handling)
+  - initial_conditions.py
+  - boundary_conditions.py
+  - checkpoint.py
+  - progress.py
+  - runner.py
+- io/
+  - config.py (load/save configs)
+  - results.py
+- tests/
+  - (unit tests for models, dynamics, ops)
+
+Core Abstractions
+- PFCModel: defines free energy and functional derivatives.
+- Dynamics: defines time evolution equations (first/second order).
+- Operators: provides Laplacian and other differential ops (spectral or finite difference).
+- Backend: executes kernels for CPU/GPU.
+- Simulation: sets up domain, boundaries, ICs, checkpoints, and runs a loop.
+  - Boundaries are boundary conditions (BCs); ICs are initial conditions.
+
+Milestones
+1) Inventory and analyze PFC2D_Vacancy + PFC2D_VaquancyMQ_CPU
+   - Map model-specific code vs dynamics vs simulation setup.
+2) Define interfaces (base classes) for model, dynamics, operators, backend, simulation.
+3) Extract free energy definitions into model layer.
+4) Implement operators: spectral Laplacian and FD Laplacian with configurable BC.
+5) Implement first-order dynamics with noise in new structure.
+6) Implement CPU backend with Numba kernels and explicit timestep control.
+7) Implement GPU backend wrappers (initially CPU-compatible kernels).
+8) Refactor PFC2D_Vacancy to new structure (2D, log model, single field).
+9) Refactor PFC2D_VaquancyMQ_CPU to new structure (CPU-specific kernels).
+10) Add dimension-agnostic support (1D/2D/3D) via domain and operators.
+11) Add tests and regression checks (energy decay, stability, perf smoke tests).
+
+Refactor Guidance
+- Keep model code pure: no domain/time/IO logic.
+- Keep dynamics code pure: no FFT/FD details beyond operator calls.
+- Simulation owns geometry, BCs, ICs, checkpoints, and progress.
+- Operators and backend handle numerical details and performance.
+
+Future Extensions
+- Second-order dynamics (d2/dt2 + d/dt).
+- Advection term in dynamics.
+- Advanced BC variants and hybrid spectral/FD schemes.
+- Multi-field and multi-mode models with shared operators.
+
+Notes
+- The general structure of a PFC model is a free energy expression in terms
+  of one (single-field) or more (multi-field) density fields and a dynamics equations
+  for changes to the field(s) for a timestep (dt). The energy expression and dynamics
+  equation have a linear (in k-space) component and a nonlinear component.  For
+  periodic boundary conditions along all borders, the linear components can be
+  calculated efficiently using FFT.  Otherwise, all finited difference or a custom
+  mixture of methods is required.
+- Any model can have additional free energy terms imposed on it with little impact
+  on the overall structure.  These additional terms are usually absorbed in the nonlinear
+  calculations in a generic way.  Custom kernels should be anticipated for these situations
+  when high performance is still needed.
+- Enforce consistent data layout and dtype at the backend level.
+- Support runtime selection of spectral vs FD operators.
+- Use configuration objects to drive model/dynamics/simulation setup.
+
+Notes on full-field vs amplitude
+- Full field uses a single n-dimension order parameter per field
+- Amplitude uses 1 (real) + 3 (complex) per mode (single-mode or multi-mode), n-dimensional
+  order parameters per field
+- Full field and amplitude have similar but distinct implementations of dynamics
+
+Notes on single-mode vs multi-mode
+- PFC2D_VaquancyMQ_CPU is an example of a generic multi-mode implementations
+- It should be feasible to build general purpose CPU or GPU multi-mode models
+- It should be feasible to build custom CPU kernels for important multi-mode models
+- It should be feasible to build custom GPU kernels for important multi-mode models
+- The difference between single-mode and multi-mode appears only in the linear terms
+  of energy and timestep calculations
+
+Notes on single-field vs multi-field
+- Multi-field are for alloys or other models with multiple species who's densities
+- need to be tracked independently, but (may) have energy cross terms and thus
+- dynamics cross terms

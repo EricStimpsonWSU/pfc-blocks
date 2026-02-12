@@ -1,0 +1,2234 @@
+# PFC General Library - Code Explanation and Documentation
+
+## Overview
+
+This document provides thorough explanations of the refactored PFC (Phase Field Crystal) 
+simulation library. Each section includes fully commented code examples with detailed 
+docstrings suitable for IntelliSense/autocomplete.
+
+## Architecture Summary
+
+The library separates concerns into six layers:
+
+1. **Model** - Defines free energy and functional derivatives (pure physics)
+2. **Operators** - Computes spatial derivatives (Laplacian, gradient, etc.)
+3. **Dynamics** - Defines time evolution equations (d/dt or d²/dt²)
+4. **Backend** - Executes computations on CPU or GPU (memory, kernels)
+5. **Domain** - Encapsulates spatial grid and boundary conditions (metadata)
+6. **Simulation** - Orchestrates the time loop (no numerical computation)
+
+---
+
+## 1. Domain Layer
+
+### Purpose
+The Domain class encapsulates all spatial grid information without storing field data.
+It knows about grid dimensions, physical size, spacing, boundary conditions, and can
+generate coordinate arrays and wavenumbers for spectral methods.
+
+### Fully Commented Implementation
+
+```python
+import numpy as np
+from typing import Tuple, Optional
+
+class Domain:
+    """
+    Spatial domain configuration for PFC simulations.
+    
+    This class encapsulates the spatial grid, geometry, and boundary conditions (BCs).
+    It does NOT hold field data; it only stores metadata about the spatial discretization.
+    
+    The domain can be 1D, 2D, or 3D and supports periodic or finite-difference boundary
+    conditions. For spectral methods (periodic BC), it pre-computes wavenumbers.
+    
+    Attributes:
+        ndim (int): Number of spatial dimensions (1, 2, or 3).
+        shape (tuple): Grid resolution in each dimension, e.g., (nx, ny) for 2D.
+        box_size (tuple): Physical domain size in each dimension, e.g., (Lx, Ly).
+        spacing (tuple): Grid spacing in each dimension, e.g., (dx, dy).
+        dtype (numpy.dtype): Data type for field arrays (default: float64).
+        bc (str): Boundary condition type ('periodic' or 'finite_difference').
+    """
+    
+    def __init__(
+        self,
+        shape: Tuple[int, ...],
+        box_size: Tuple[float, ...],
+        dtype=np.float64,
+        bc: str = 'periodic'
+    ):
+        """
+        Initialize spatial domain with grid dimensions and physical size.
+        
+        Args:
+            shape: Tuple of grid points in each dimension.
+                   Examples: (256,) for 1D, (256, 256) for 2D, (64, 64, 64) for 3D.
+                   Each element must be a positive integer.
+                   
+            box_size: Tuple of physical domain sizes in each dimension.
+                      Examples: (100.0,) for 1D, (100.0, 100.0) for 2D.
+                      Each element must be positive. Units are arbitrary but consistent.
+                      
+            dtype: NumPy data type for field arrays. Default is np.float64.
+                   Options: np.float32 (less memory, less precision),
+                           np.float64 (standard precision),
+                           np.complex128 (for complex fields).
+                           
+            bc: Boundary condition type. Default is 'periodic'.
+                Options:
+                    'periodic' - Periodic boundaries (use with spectral operators)
+                    'finite_difference' - Non-periodic (use with FD operators)
+                    
+        Raises:
+            ValueError: If shape and box_size have different lengths.
+            
+        Example:
+            >>> # Create a 2D domain with 256x256 grid and 100x100 physical size
+            >>> domain = Domain(shape=(256, 256), box_size=(100.0, 100.0))
+            >>> print(f"Grid spacing: {domain.spacing}")
+            Grid spacing: (0.390625, 0.390625)
+        """
+        # Store grid dimensions (number of points in each direction)
+        self._shape = shape
+        
+        # Store physical domain size (real-space extent in each direction)
+        self._box_size = box_size
+        
+        # Store data type for numerical arrays
+        self._dtype = dtype
+        
+        # Store boundary condition type
+        self._bc = bc
+        
+        # Validate that shape and box_size have the same dimensionality
+        if len(shape) != len(box_size):
+            raise ValueError(
+                f"shape and box_size must have same dimension. "
+                f"Got shape={shape} (ndim={len(shape)}) and "
+                f"box_size={box_size} (ndim={len(box_size)})"
+            )
+        
+        # Pre-compute grid spacing (dx, dy, dz, ...) for each dimension
+        # Spacing is physical_size / number_of_points
+        self._spacing = tuple(L / n for L, n in zip(box_size, shape))
+        
+        # Initialize caches for expensive computations (computed on first access)
+        self._wavenumbers: Optional[Tuple] = None  # k-vectors for FFT
+        self._coordinates: Optional[Tuple] = None  # real-space positions
+    
+    @property
+    def ndim(self) -> int:
+        """
+        Number of spatial dimensions.
+        
+        Returns:
+            int: Dimensionality of the domain (1, 2, or 3).
+            
+        Example:
+            >>> domain = Domain(shape=(256, 256), box_size=(100.0, 100.0))
+            >>> domain.ndim
+            2
+        """
+        return len(self._shape)
+    
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """
+        Grid resolution (number of points) in each dimension.
+        
+        Returns:
+            tuple: Grid shape. For 1D: (nx,), 2D: (nx, ny), 3D: (nx, ny, nz).
+            
+        Example:
+            >>> domain = Domain(shape=(128, 256), box_size=(50.0, 100.0))
+            >>> domain.shape
+            (128, 256)
+        """
+        return self._shape
+    
+    @property
+    def box_size(self) -> Tuple[float, ...]:
+        """
+        Physical domain size in each dimension.
+        
+        Returns:
+            tuple: Physical size. For 1D: (Lx,), 2D: (Lx, Ly), 3D: (Lx, Ly, Lz).
+            
+        Example:
+            >>> domain = Domain(shape=(256, 256), box_size=(100.0, 100.0))
+            >>> domain.box_size
+            (100.0, 100.0)
+        """
+        return self._box_size
+    
+    @property
+    def spacing(self) -> Tuple[float, ...]:
+        """
+        Grid spacing (distance between adjacent points) in each dimension.
+        
+        Computed as spacing[i] = box_size[i] / shape[i].
+        
+        Returns:
+            tuple: Grid spacing. For 1D: (dx,), 2D: (dx, dy), 3D: (dx, dy, dz).
+            
+        Example:
+            >>> domain = Domain(shape=(100, 200), box_size=(10.0, 20.0))
+            >>> domain.spacing
+            (0.1, 0.1)
+        """
+        return self._spacing
+    
+    @property
+    def dtype(self):
+        """
+        Data type for field arrays.
+        
+        Returns:
+            numpy.dtype: The NumPy dtype (e.g., float64, float32, complex128).
+            
+        Example:
+            >>> domain = Domain(shape=(256,), box_size=(100.0,), dtype=np.float32)
+            >>> domain.dtype
+            dtype('float32')
+        """
+        return self._dtype
+    
+    @property
+    def bc(self) -> str:
+        """
+        Boundary condition type.
+        
+        Returns:
+            str: Boundary condition identifier ('periodic' or 'finite_difference').
+            
+        Example:
+            >>> domain = Domain(shape=(256, 256), box_size=(100.0, 100.0), bc='periodic')
+            >>> domain.bc
+            'periodic'
+        """
+        return self._bc
+    
+    def get_wavenumbers(self) -> Tuple[np.ndarray, ...]:
+        """
+        Generate k-space wavenumbers for spectral (FFT) methods.
+        
+        Wavenumbers are computed using NumPy's fftfreq and are suitable for use
+        with numpy.fft.fft2 or cupy.fft.fft2. The k-vectors are cached after
+        first computation for efficiency.
+        
+        For periodic boundary conditions, the wavenumbers are:
+            k[i] = 2π * fftfreq(shape[i], d=spacing[i])
+        
+        Returns:
+            tuple: Tuple of 1D wavenumber arrays, one per dimension.
+                   For 1D: (kx,)
+                   For 2D: (kx, ky)
+                   For 3D: (kx, ky, kz)
+                   Each array has length shape[i] and dtype float64.
+                   
+        Note:
+            This method is only meaningful for periodic boundary conditions.
+            For finite-difference methods, wavenumbers are not used.
+            
+        Example:
+            >>> domain = Domain(shape=(4, 4), box_size=(2*np.pi, 2*np.pi))
+            >>> kx, ky = domain.get_wavenumbers()
+            >>> print(kx)  # Wavenumbers for x-direction
+            [ 0.  1.  2. -1.]
+        """
+        # Check if wavenumbers have already been computed (lazy evaluation)
+        if self._wavenumbers is None:
+            k_arrays = []
+            
+            # Compute wavenumber array for each spatial dimension
+            for i, (n, L) in enumerate(zip(self._shape, self._box_size)):
+                # fftfreq returns frequencies in cycles/sample
+                # Multiply by 2π to get angular wavenumbers (radians/distance)
+                # The spacing is L/n (physical_size / number_of_points)
+                k = 2.0 * np.pi * np.fft.fftfreq(n, L / n)
+                k_arrays.append(k)
+            
+            # Cache the result as a tuple for immutability
+            self._wavenumbers = tuple(k_arrays)
+        
+        return self._wavenumbers
+    
+    def get_coordinates(self) -> Tuple[np.ndarray, ...]:
+        """
+        Generate real-space coordinate arrays.
+        
+        Creates 1D arrays of spatial positions for each dimension. The coordinates
+        start at 0 and end at box_size (exclusive) with spacing determined by
+        the grid resolution. These arrays are cached after first computation.
+        
+        Returns:
+            tuple: Tuple of 1D coordinate arrays, one per dimension.
+                   For 1D: (x,)
+                   For 2D: (x, y)
+                   For 3D: (x, y, z)
+                   Each array has length shape[i] and uses domain.dtype.
+                   
+        Note:
+            These are 1D arrays, not meshgrids. To create a meshgrid for
+            evaluating functions, use numpy.meshgrid(x, y) or similar.
+            
+        Example:
+            >>> domain = Domain(shape=(4,), box_size=(10.0,))
+            >>> x, = domain.get_coordinates()
+            >>> print(x)
+            [0.  2.5 5.  7.5]
+            
+            >>> # For 2D, create meshgrid for function evaluation:
+            >>> domain2d = Domain(shape=(3, 3), box_size=(6.0, 6.0))
+            >>> x, y = domain2d.get_coordinates()
+            >>> X, Y = np.meshgrid(x, y)
+            >>> phi = np.sin(X) * np.cos(Y)  # Example field
+        """
+        # Check if coordinates have already been computed (lazy evaluation)
+        if self._coordinates is None:
+            coord_arrays = []
+            
+            # Generate coordinate array for each spatial dimension
+            for i, (n, L) in enumerate(zip(self._shape, self._box_size)):
+                # linspace creates n evenly spaced points from 0 to L (exclusive)
+                # endpoint=False ensures periodicity for periodic BCs
+                x = np.linspace(0, L, n, endpoint=False, dtype=self._dtype)
+                coord_arrays.append(x)
+            
+            # Cache the result as a tuple
+            self._coordinates = tuple(coord_arrays)
+        
+        return self._coordinates
+```
+
+---
+
+## 2. Model Layer
+
+### Purpose
+The Model defines the physics of the system through free energy functionals and their
+derivatives. It is completely decoupled from numerical methods (FFT, finite difference),
+time evolution, and domain information.
+
+### Fully Commented Implementation
+
+```python
+from abc import ABC, abstractmethod
+from typing import Dict, Optional, Tuple
+import numpy as np
+import cupy as cp
+
+class PFCModel(ABC):
+    """
+    Abstract base class for phase field crystal (PFC) models.
+    
+    A PFC model defines:
+    1. The free energy functional F[φ] as a function of density field(s) φ
+    2. The functional derivative δF/δφ (force driving time evolution)
+    
+    The model is pure physics with no knowledge of:
+    - Domain geometry (set by simulation via set_field_shape)
+    - Time stepping (handled by dynamics layer)
+    - Spatial operators (provided by operators layer)
+    - I/O or visualization
+    
+    Subclasses must implement:
+    - num_fields: number of density fields (1 for single-field, >1 for alloys)
+    - functional_derivative: compute δF/δφ
+    - free_energy: compute total F
+    """
+    
+    def __init__(self):
+        """
+        Initialize base model.
+        
+        Sets up internal storage for field shape and configuration.
+        Subclasses should call super().__init__() before their own initialization.
+        """
+        # Field shape will be set by simulation before first use
+        self._field_shape: Optional[Tuple[int, ...]] = None
+        
+        # Configuration dictionary for model parameters
+        self._config: Dict = {}
+    
+    @property
+    @abstractmethod
+    def num_fields(self) -> int:
+        """
+        Number of independent density fields in the model.
+        
+        Returns:
+            int: Field count. 1 for single-field PFC, 2+ for binary/ternary alloys.
+                 Range: [1, ∞), typically 1-3.
+                 
+        Example:
+            >>> model = LogPFCModel2D(epsilon=-0.25, beta=1.0, ...)
+            >>> model.num_fields
+            1
+        """
+        pass
+    
+    @property
+    def field_shape(self) -> Optional[Tuple[int, ...]]:
+        """
+        Shape of a single field array.
+        
+        This is set by the simulation via set_field_shape() before the first
+        timestep. It matches the domain.shape.
+        
+        Returns:
+            tuple or None: Grid shape (nx,) or (nx, ny) or (nx, ny, nz).
+                          None if not yet initialized.
+                          
+        Example:
+            >>> model.set_field_shape((256, 256))
+            >>> model.field_shape
+            (256, 256)
+        """
+        return self._field_shape
+    
+    @abstractmethod
+    def functional_derivative(
+        self, 
+        fields: Dict[str, np.ndarray], 
+        mode_data: Optional[Dict] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute functional derivatives (variational derivatives) of free energy.
+        
+        The functional derivative δF/δφ represents the "force" or "chemical potential"
+        that drives time evolution in the PFC equations. This method computes the
+        nonlinear part; linear parts (Laplacian, etc.) are handled by operators.
+        
+        Args:
+            fields: Dictionary mapping field names to n-dimensional arrays.
+                    For single-field: {'phi': phi_array}
+                    For binary alloy: {'phiA': phiA_array, 'phiB': phiB_array}
+                    Arrays should have shape matching self.field_shape.
+                    Values typically in range [-1, 5] for log models.
+                    
+            mode_data: Optional dictionary with precomputed mode information.
+                      For amplitude expansion models, may contain Fourier modes.
+                      For full-field models, usually None.
+                      Default: None.
+                      
+        Returns:
+            dict: Maps field names to functional derivative arrays.
+                  Same keys as input fields, same array shapes and dtypes.
+                  Values represent δF/δφ in real space.
+                  
+        Raises:
+            KeyError: If required fields are missing from input.
+            ValueError: If field shapes don't match expected shape.
+            
+        Example:
+            >>> phi = np.random.randn(256, 256) * 0.1
+            >>> deriv = model.functional_derivative({'phi': phi})
+            >>> print(deriv['phi'].shape)
+            (256, 256)
+        """
+        pass
+    
+    @abstractmethod
+    def free_energy(
+        self, 
+        fields: Dict[str, np.ndarray], 
+        mode_data: Optional[Dict] = None
+    ) -> float:
+        """
+        Compute total free energy of the system.
+        
+        The free energy F is a scalar value representing the thermodynamic state
+        of the system. It should decrease over time for stable dynamics (second
+        law of thermodynamics for conserved order parameter).
+        
+        Args:
+            fields: Dictionary mapping field names to n-dimensional arrays.
+                    Same format as functional_derivative.
+                    
+            mode_data: Optional dictionary with k-space data for linear energy.
+                      May include 'phi_hat' (FFT of phi), 'k2', 'k4' for spectral models.
+                      Required for accurate total energy with spectral operators.
+                      Default: None (linear energy omitted or approximated).
+                      
+        Returns:
+            float: Total free energy per lattice site (intensive quantity).
+                   Units are arbitrary but consistent with model parameters.
+                   Typically normalized by domain volume (nx * ny * nz).
+                   
+        Note:
+            Energy calculation may require Fourier space data for linear terms.
+            Without mode_data, only nonlinear energy contributions are computed.
+            
+        Example:
+            >>> energy = model.free_energy({'phi': phi})
+            >>> print(f"Free energy: {energy:.6e}")
+            Free energy: -1.234567e-03
+        """
+        pass
+    
+    def set_field_shape(self, shape: Tuple[int, ...]) -> None:
+        """
+        Set the spatial dimensions of field arrays.
+        
+        Called by the simulation before first use to inform the model of grid size.
+        This allows the model to allocate temporary arrays or validate inputs.
+        
+        Args:
+            shape: Grid dimensions. For 1D: (nx,), 2D: (nx, ny), 3D: (nx, ny, nz).
+                   Must match domain.shape from simulation.
+                   Each element must be a positive integer.
+                   Typical range: [16, 2048] per dimension.
+                   
+        Example:
+            >>> model = LogPFCModel2D(epsilon=-0.25, beta=1.0, ...)
+            >>> model.set_field_shape((256, 256))
+            >>> # Model now knows fields will be 256x256 arrays
+        """
+        self._field_shape = shape
+    
+    def configure(self, config: Dict) -> None:
+        """
+        Accept configuration dictionary for model parameters.
+        
+        Subclasses can override this to extract and validate parameters from
+        a configuration dictionary (e.g., loaded from JSON or YAML file).
+        
+        Args:
+            config: Dictionary of model parameters. Keys and values are model-specific.
+                    Example: {'temperature': 0.5, 'interaction_strength': 1.2}
+                    
+        Example:
+            >>> config = {'epsilon': -0.25, 'beta': 1.0}
+            >>> model.configure(config)
+        """
+        self._config = config
+
+
+class LogPFCModel2D(PFCModel):
+    """
+    Logarithmic phase field crystal model for 2D single-field systems.
+    
+    This model describes crystal formation with a logarithmic free energy term
+    that penalizes negative densities, preventing unphysical void formation.
+    
+    Free energy functional:
+        F[φ] = ∫ dx [ f_linear(φ) + f_polynomial(φ) + f_log(φ) + f_vacancy(φ) ]
+    
+    where:
+        f_linear = β/2 * φ * (∇²φ - (∇²)²φ)  [elastic energy, computed in k-space]
+        f_polynomial = ε·φ²/2 + g·φ³/3 + v0·φ⁴/4  [standard polynomial]
+        f_log = Hln · (φ+a) · ln(φ+a)  [logarithmic penalty]
+        f_vacancy = -6·Hng·φ²  for φ<0  [vacancy formation energy]
+    
+    This is a full-field (not amplitude expansion), single-field, single-mode model.
+    """
+    
+    def __init__(
+        self,
+        epsilon: float,
+        beta: float,
+        g: float,
+        v0: float,
+        Hln: float,
+        Hng: float = 0.0,
+        a: float = 0.0,
+        phi0: float = 0.0,
+        min_log: float = -10.0
+    ):
+        """
+        Initialize logarithmic PFC model with thermodynamic parameters.
+        
+        Args:
+            epsilon: Reduced temperature parameter (controls liquid ↔ crystal transition).
+                     Typical range: [-0.5, 0.5]
+                     Negative values favor crystallization.
+                     Zero is the critical point.
+                     Positive values favor liquid phase.
+                     
+            beta: Elastic modulus (controls crystal lattice spacing and stiffness).
+                  Typical range: [0.5, 2.0]
+                  Larger values → stiffer crystals, smaller lattice spacing.
+                  Must be positive.
+                  
+            g: Cubic nonlinearity coefficient (asymmetry in phase diagram).
+               Typical range: [-1.0, 1.0]
+               Zero gives symmetric liquid-crystal coexistence.
+               Nonzero shifts equilibrium densities.
+               
+            v0: Quartic nonlinearity coefficient (density self-interaction).
+                Typical range: [0.5, 2.0]
+                Must be positive for bounded energy.
+                Controls strength of density fluctuations.
+                
+            Hln: Logarithmic term strength (penalty for negative density).
+                 Typical range: [0.0, 5.0]
+                 Zero recovers standard PFC.
+                 Larger values → stronger penalty on voids.
+                 
+            Hng: Vacancy penalty strength (extra cost for negative density).
+                 Typical range: [0.0, 2.0]
+                 Default: 0.0 (no extra penalty)
+                 Larger values → harder to form vacancies.
+                 
+            a: Shift parameter for logarithmic term (sets density scale).
+               Typical range: [-0.5, 0.5]
+               Default: 0.0
+               Adjusted to match density scale of simulations.
+               
+            phi0: Average density (conserved quantity in most dynamics).
+                  Typical range: [-0.5, 0.5]
+                  Default: 0.0
+                  Determines liquid vs crystal fraction.
+                  
+            min_log: Minimum logarithm value to prevent numerical overflow.
+                     Typical range: [-20, -5]
+                     Default: -10.0
+                     For φ < exp(min_log) - a, use min_log instead of log(φ+a).
+                     
+        Example:
+            >>> # Parameters for crystallization near T_m (melting temperature)
+            >>> model = LogPFCModel2D(
+            ...     epsilon=-0.25,  # Below critical temperature
+            ...     beta=1.0,       # Standard elastic constant
+            ...     g=0.0,          # Symmetric
+            ...     v0=1.0,         # Standard quartic
+            ...     Hln=1.0,        # Moderate log penalty
+            ...     Hng=0.5,        # Small vacancy cost
+            ...     phi0=-0.35      # Average density for crystal
+            ... )
+        """
+        super().__init__()
+        
+        # Convert all parameters to GPU (CuPy) float64 for numerical precision
+        # This ensures all arithmetic is performed on GPU in double precision
+        self.epsilon = cp.float64(epsilon)
+        self.beta = cp.float64(beta)
+        self.g = cp.float64(g)
+        self.v0 = cp.float64(v0)
+        self.Hln = cp.float64(Hln)
+        self.Hng = cp.float64(Hng)
+        self.a = cp.float64(a)
+        self.phi0 = cp.float64(phi0)
+        self.min_log = cp.float64(min_log)
+        
+        # Pre-compute minimum phi value where log is safe to evaluate
+        # For φ < min_phi, we use min_log to avoid log of negative numbers
+        self.min_phi = cp.exp(self.min_log) - self.a
+    
+    @property
+    def num_fields(self) -> int:
+        """
+        Single density field (phi).
+        
+        Returns:
+            int: Always 1 for Log PFC model (single-component system).
+        """
+        return 1
+    
+    def functional_derivative(
+        self, 
+        fields: Dict[str, cp.ndarray], 
+        mode_data: Optional[Dict] = None
+    ) -> Dict[str, cp.ndarray]:
+        """
+        Compute nonlinear part of functional derivative δF/δφ.
+        
+        The functional derivative has two parts:
+        1. Linear part: L(φ) = [ε + (1+∇²)²] φ  [handled by operators layer]
+        2. Nonlinear part: N(φ) = g·φ² + v0·φ³ + Hln·log(φ+a) - 6·Hng·φ²·H(-φ)
+        
+        This method computes N(φ), the nonlinear part only.
+        
+        Args:
+            fields: Dictionary with 'phi' key mapping to density field array.
+                    Array should be GPU (CuPy) array with shape matching domain.
+                    Typical phi range: [-0.8, 2.0] for log models.
+                    
+            mode_data: Unused for this model (not an amplitude expansion).
+                      Default: None.
+                      
+        Returns:
+            dict: Dictionary with 'phi' key mapping to nonlinear functional derivative.
+                  Same shape and dtype as input phi.
+                  On GPU (CuPy array).
+                  
+        Note:
+            All computations are performed on GPU using CuPy for efficiency.
+            The logarithmic term is evaluated safely with a cutoff at min_phi.
+            
+        Example:
+            >>> import cupy as cp
+            >>> phi = cp.random.randn(256, 256) * 0.1  # Small fluctuations
+            >>> deriv = model.functional_derivative({'phi': phi})
+            >>> N_phi = deriv['phi']  # Nonlinear force
+        """
+        # Extract phi from input dictionary
+        phi = fields['phi']
+        
+        # Quadratic term: contribution from g·φ² in free energy
+        # Functional derivative: δ(g·φ²)/δφ = 2·g·φ
+        phi2 = self.g * cp.power(phi, 2)
+        
+        # Cubic term: contribution from v0·φ³ in free energy
+        # Functional derivative: δ(v0·φ³)/δφ = 3·v0·φ²
+        phi3 = self.v0 * cp.power(phi, 3)
+        
+        # Vacancy penalty: -6·Hng·φ² for φ < 0 only
+        # This term penalizes negative density (voids/vacancies)
+        # The factor of -6 comes from derivative of 3·φ·(|φ| - φ)
+        phivac = -6 * self.Hng * cp.power(phi, 2) * (phi < 0)
+        
+        # Logarithmic term with safe evaluation to avoid log(<0)
+        # Free energy: Hln·(φ+a)·log(φ+a)
+        # Functional derivative: Hln·[log(φ+a) + 1]
+        # We approximate as Hln·log(φ+a) and use cutoff for numerical safety
+        philn = cp.ones_like(phi) * self.min_log
+        pos_mask = phi > self.min_phi  # Only evaluate log where safe
+        philn[pos_mask] = self.Hln * cp.log(phi[pos_mask] + self.a)
+        
+        # Total nonlinear functional derivative
+        # This is N(φ) = δF_nonlinear/δφ
+        dF_dphi = phi2 + phi3 + phivac + philn
+        
+        return {'phi': dF_dphi}
+    
+    def free_energy(
+        self, 
+        fields: Dict[str, cp.ndarray], 
+        mode_data: Optional[Dict] = None
+    ) -> float:
+        """
+        Compute total free energy F[φ] per lattice site.
+        
+        The total energy includes linear (elastic) and nonlinear (chemical) parts.
+        Linear energy requires k-space data from mode_data.
+        
+        Args:
+            fields: Dictionary with 'phi' key mapping to density field (GPU array).
+                    
+            mode_data: Dictionary with Fourier-space data for linear energy.
+                      Required keys:
+                          'phi_hat': FFT of phi (complex GPU array)
+                          'k2': k² array (real GPU array)
+                          'k4': k⁴ array (real GPU array)
+                      If None, linear energy is omitted (only nonlinear energy computed).
+                      Default: None.
+                      
+        Returns:
+            float: Free energy per site. Units: [energy] = [parameter units].
+                   Negative values are typical for stable crystalline states.
+                   Should decrease monotonically for gradient-flow dynamics.
+                   
+        Note:
+            The energy is normalized by the number of lattice sites (nx * ny)
+            to make it intensive (independent of system size).
+            
+        Example:
+            >>> # Compute energy with k-space data
+            >>> phi_hat = cp.fft.fft2(phi)
+            >>> mode_data = {'phi_hat': phi_hat, 'k2': operators.k2, 'k4': operators.k4}
+            >>> energy = model.free_energy({'phi': phi}, mode_data)
+            >>> print(f"Energy per site: {energy:.6e}")
+        """
+        phi = fields['phi']
+        
+        # Linear (elastic) energy: computed in k-space if mode_data provided
+        # E_linear = β/2 * ∫ φ·[(∇²)² - 2·∇²]·φ dx
+        # In k-space: β/2 * ∫ |φ̂|²·[k⁴ - 2·k²] dk
+        if mode_data is not None and 'phi_hat' in mode_data:
+            phi_hat = mode_data['phi_hat']
+            k2 = mode_data['k2']
+            k4 = mode_data['k4']
+            
+            # Linear energy coefficient in k-space
+            linenergycoeff = self.beta * (-2 * k2 + k4) / 2
+            
+            # Transform back to real space: E_lin(x) = φ(x) · [coeff · φ̂]⁻¹(x)
+            energy_lin_phi = cp.fft.ifft2(linenergycoeff * phi_hat).real
+            energy_lin = phi * energy_lin_phi
+        else:
+            # If no k-space data, omit linear energy
+            energy_lin = 0
+        
+        # Logarithmic energy: Hln·(φ+a)·ln(φ+a)
+        # Only evaluate where φ + a > 0 to avoid log of negative
+        energy_ln = cp.zeros_like(phi)
+        pos_mask = phi > -self.a
+        energy_ln[pos_mask] = self.Hln * (phi[pos_mask] + self.a) * cp.log(phi[pos_mask] + self.a)
+        
+        # Polynomial energy: ε·φ²/2 + g·φ³/3 + v0·φ⁴/4
+        # The (ε + β) term avoids double-counting with linear energy
+        energy_poly = (
+            0.5 * (self.epsilon + self.beta) * cp.power(phi, 2) +
+            (1.0/3.0) * self.g * cp.power(phi, 3) +
+            0.25 * self.v0 * cp.power(phi, 4)
+        )
+        
+        # Total energy density at each point
+        energy = energy_lin + energy_ln + energy_poly
+        
+        # Average over all lattice sites (intensive quantity)
+        nx, ny = phi.shape
+        f = energy.sum() / (nx * ny)
+        
+        # Convert from GPU to CPU scalar for return
+        return float(f)
+```
+
+---
+
+## 3. Operators Layer
+
+### Purpose
+Operators compute spatial derivatives (Laplacian, gradient, bilaplacian) using either
+spectral (FFT) or finite-difference methods. They abstract away the numerical details
+from the model and dynamics layers.
+
+### Fully Commented Implementation
+
+```python
+from typing import Dict
+import cupy as cp
+from abc import ABC, abstractmethod
+
+class Operators(ABC):
+    """
+    Abstract base for spatial differential operators.
+    
+    Provides Laplacian, bilaplacian, and gradient operations in either spectral
+    (FFT-based) or finite-difference form. The choice of method affects boundary
+    conditions: spectral assumes periodic, FD can handle various BCs.
+    """
+    
+    @property
+    @abstractmethod
+    def method(self) -> str:
+        """Method identifier: 'spectral' or 'finite_difference'."""
+        pass
+    
+    @abstractmethod
+    def laplacian(self, field: cp.ndarray) -> cp.ndarray:
+        """
+        Compute Laplacian (∇² field).
+        
+        Args:
+            field: Input field (GPU array). Shape: (ny, nx) for 2D.
+                   Typical range: any real values.
+                   
+        Returns:
+            Laplacian of field, same shape and dtype.
+            Units: [field] / [length]².
+        """
+        pass
+
+
+class SpectralOperators2D(Operators):
+    """
+    Spectral (FFT-based) operators for 2D periodic domains.
+    
+    Uses fast Fourier transform to compute derivatives efficiently on periodic grids.
+    All operations are O(N log N) where N is the number of grid points.
+    
+    The Laplacian is computed as:
+        ∇²φ = FFT⁻¹[ -k² · FFT[φ] ]
+    
+    where k² = kₓ² + k_y² is precomputed from domain wavenumbers.
+    
+    A spectral anomaly correction is applied to reduce Gibbs oscillations:
+        k² = 2·[(1-cos(kₓ·dx))/dx² + (1-cos(k_y·dy))/dy²]
+    instead of the standard k² = kₓ² + k_y².
+    """
+    
+    def __init__(self, domain=None):
+        """
+        Initialize spectral operators for a domain.
+        
+        Args:
+            domain: Domain instance with shape, spacing, and wavenumbers.
+                    If None, must call configure() before using operators.
+                    Default: None.
+                    
+        Example:
+            >>> operators = SpectralOperators2D(domain)
+            >>> # or
+            >>> operators = SpectralOperators2D()
+            >>> operators.configure({'domain': domain})
+        """
+        super().__init__()
+        self._domain = domain
+        self._kx = None  # x-direction wavenumbers (1D array)
+        self._ky = None  # y-direction wavenumbers (1D array)
+        self._k2 = None  # k² = kₓ² + k_y² (2D array)
+        self._k4 = None  # k⁴ = (k²)² (2D array)
+        self._k6 = None  # k⁶ = (k²)³ (2D array)
+        
+        if domain is not None:
+            self._setup_kernels(domain)
+    
+    def _setup_kernels(self, domain):
+        """
+        Pre-compute k-space kernels from domain.
+        
+        This method extracts wavenumbers from the domain and builds 2D meshgrids
+        of kₓ, k_y, and powers of k² on the GPU. These kernels are reused for
+        all subsequent derivative operations.
+        
+        Args:
+            domain: Domain instance with get_wavenumbers() method.
+                    Must have 2D shape (ny, nx).
+                    
+        Note:
+            This is called automatically by __init__ if domain is provided,
+            or by configure() if domain is set later.
+        """
+        # Get 1D wavenumber arrays from domain (on CPU)
+        kx_cpu, ky_cpu = domain.get_wavenumbers()
+        
+        # Transfer wavenumbers to GPU for fast computation
+        kx = cp.asarray(kx_cpu)
+        ky = cp.asarray(ky_cpu)
+        
+        # Create 2D meshgrids: every (kₓ, k_y) pair
+        # self._kx[i, j] = kₓ[j], self._ky[i, j] = k_y[i]
+        self._kx, self._ky = cp.meshgrid(kx, ky)
+        
+        # Compute k² with spectral anomaly correction
+        # Standard formula: k² = kₓ² + k_y²
+        # Corrected formula reduces numerical artifacts for rapidly-varying fields
+        # Uses finite-difference-like formula in k-space
+        dx, dy = domain.spacing
+        self._k2 = 2 * (
+            (1 / dx**2) * (1 - cp.cos(self._kx * dx)) +
+            (1 / dy**2) * (1 - cp.cos(self._ky * dy))
+        )
+        
+        # Pre-compute higher powers for efficiency
+        # k⁴ is needed for biharmonic operator (∇⁴)
+        # k⁶ appears in some PFC linear terms
+        self._k4 = self._k2**2
+        self._k6 = self._k2**3
+    
+    @property
+    def method(self) -> str:
+        """
+        Operator method identifier.
+        
+        Returns:
+            str: Always 'spectral' for this class.
+        """
+        return 'spectral'
+    
+    @property
+    def k2(self) -> cp.ndarray:
+        """
+        k² kernel for Laplacian operator.
+        
+        Returns:
+            cupy.ndarray: 2D array of k² values, shape (ny, nx).
+                         Units: [1/length]².
+                         Range: [0, k_max²] where k_max ~ π/dx.
+                         
+        Example:
+            >>> k2 = operators.k2
+            >>> print(f"Max k²: {k2.max():.2f}")
+        """
+        return self._k2
+    
+    @property
+    def k4(self) -> cp.ndarray:
+        """
+        k⁴ kernel for bilaplacian operator.
+        
+        Returns:
+            cupy.ndarray: 2D array of k⁴ values, shape (ny, nx).
+                         Units: [1/length]⁴.
+        """
+        return self._k4
+    
+    @property
+    def k6(self) -> cp.ndarray:
+        """
+        k⁶ kernel for high-order operators.
+        
+        Returns:
+            cupy.ndarray: 2D array of k⁶ values, shape (ny, nx).
+                         Units: [1/length]⁶.
+        """
+        return self._k6
+    
+    def laplacian(self, field: cp.ndarray) -> cp.ndarray:
+        """
+        Compute Laplacian using FFT: ∇²φ = FFT⁻¹[-k² · FFT[φ]].
+        
+        This is the most efficient method for computing the Laplacian on periodic
+        domains. Complexity is O(N log N) for N grid points, compared to O(N²)
+        for naive finite differences.
+        
+        Args:
+            field: 2D density field (GPU array).
+                   Shape: (ny, nx) matching domain.
+                   Dtype: float64 or complex128.
+                   Typical range: any real values.
+                   
+        Returns:
+            Laplacian ∇²φ as 2D GPU array (real part only).
+            Same shape as input.
+            Dtype: float64.
+            Units: [field] / [length]².
+            
+        Example:
+            >>> import cupy as cp
+            >>> phi = cp.random.randn(256, 256)
+            >>> lap_phi = operators.laplacian(phi)
+            >>> # Verify: for sin(kx), ∇²sin(kx) = -k² sin(kx)
+        """
+        # Forward FFT: transform to k-space
+        # field_hat[k] = ∑_x field[x] · exp(-i·k·x)
+        field_hat = cp.fft.fft2(field)
+        
+        # Multiply by -k² kernel (Laplacian in k-space)
+        # Fourier transform of ∇² is multiplication by -k²
+        laplacian_hat = -self._k2 * field_hat
+        
+        # Inverse FFT: transform back to real space
+        # Take real part since input was real (imaginary part is ~0 up to numerics)
+        return cp.fft.ifft2(laplacian_hat).real
+    
+    def bilaplacian(self, field: cp.ndarray) -> cp.ndarray:
+        """
+        Compute bilaplacian (∇⁴ field) using FFT: ∇⁴φ = FFT⁻¹[k⁴ · FFT[φ]].
+        
+        The bilaplacian (∇⁴ = ∇² ∇²) appears in thin-film and PFC models.
+        It represents fourth-order diffusion or elasticity.
+        
+        Args:
+            field: 2D density field (GPU array).
+                   Shape: (ny, nx).
+                   
+        Returns:
+            Bilaplacian ∇⁴φ as 2D GPU array (real).
+            Units: [field] / [length]⁴.
+            
+        Note:
+            For fourth-order PDEs, the bilaplacian term controls smoothness.
+            Larger bilaplacian → smoother solutions.
+            
+        Example:
+            >>> bilap_phi = operators.bilaplacian(phi)
+            >>> # For plane wave exp(i·k·x): ∇⁴ exp(i·k·x) = k⁴ exp(i·k·x)
+        """
+        field_hat = cp.fft.fft2(field)
+        
+        # Multiply by +k⁴ (bilaplacian in k-space)
+        # Note: positive sign, unlike Laplacian which has negative
+        bilaplacian_hat = self._k4 * field_hat
+        
+        return cp.fft.ifft2(bilaplacian_hat).real
+    
+    def gradient(self, field: cp.ndarray, axis: int) -> cp.ndarray:
+        """
+        Compute gradient along specified axis using FFT.
+        
+        The gradient in Fourier space is:
+            ∂φ/∂x = FFT⁻¹[i·kₓ · FFT[φ]]
+            ∂φ/∂y = FFT⁻¹[i·k_y · FFT[φ]]
+        
+        Args:
+            field: 2D density field (GPU array).
+                   Shape: (ny, nx).
+                   
+            axis: Direction of derivative.
+                  0 = x-direction (horizontal, ∂/∂x)
+                  1 = y-direction (vertical, ∂/∂y)
+                  Range: [0, 1] for 2D.
+                  
+        Returns:
+            Gradient component as 2D GPU array (real).
+            Units: [field] / [length].
+            
+        Raises:
+            ValueError: If axis is not 0 or 1.
+            
+        Example:
+            >>> # Compute x-gradient
+            >>> grad_x = operators.gradient(phi, axis=0)
+            >>> # Compute y-gradient
+            >>> grad_y = operators.gradient(phi, axis=1)
+            >>> # Gradient magnitude: |∇φ|
+            >>> grad_mag = cp.sqrt(grad_x**2 + grad_y**2)
+        """
+        field_hat = cp.fft.fft2(field)
+        
+        # Multiply by i·k in the specified direction
+        if axis == 0:
+            grad_hat = 1j * self._kx * field_hat
+        elif axis == 1:
+            grad_hat = 1j * self._ky * field_hat
+        else:
+            raise ValueError(f"axis must be 0 or 1 for 2D, got {axis}")
+        
+        return cp.fft.ifft2(grad_hat).real
+    
+    def configure(self, config: Dict) -> None:
+        """
+        Configure operators with domain information.
+        
+        This method is called by the simulation to provide domain metadata
+        (wavenumbers, spacing, etc.) to the operators. It triggers kernel
+        pre-computation via _setup_kernels().
+        
+        Args:
+            config: Configuration dictionary.
+                    Required key: 'domain' → Domain instance
+                    
+        Example:
+            >>> operators = SpectralOperators2D()
+            >>> operators.configure({'domain': domain})
+            >>> # Now operators.k2, operators.laplacian() etc. are ready
+        """
+        super().configure(config)
+        if 'domain' in config:
+            self._domain = config['domain']
+            self._setup_kernels(self._domain)
+```
+
+---
+
+## 4. Dynamics Layer
+
+### Purpose
+Dynamics defines the time evolution equations that govern how density fields change
+over time. It assembles linear and nonlinear terms from operators and model without
+performing low-level FFT or finite difference operations directly.
+
+### Fully Commented Implementation
+
+```python
+from typing import Dict, Optional, Callable
+import cupy as cp
+from abc import ABC, abstractmethod
+
+class FirstOrderDynamics:
+    """
+    First-order gradient-flow dynamics with exponential time differencing (ETD).
+    
+    Governs time evolution via:
+        ∂φ/∂t = L(φ) + N(φ) + η(x,t)
+    
+    where:
+        L(φ) = linear operator from model (often spectral: coefficients × φ̂)
+        N(φ) = nonlinear functional derivative from model
+        η(x,t) = stochastic noise (optional)
+    
+    This class uses a predictor-corrector ETD scheme for numerical stability,
+    allowing larger timesteps than forward Euler while preserving accuracy.
+    
+    ETD Scheme:
+        1. Predictor: φ₁ = exp(L·dt)·φ₀ + ETD₁[N(φ₀)]
+        2. Corrector: φ₁ = exp(L·dt)·φ₀ + ETD₁[N(φ₀)] + ETD₂[dN/dt]
+    
+    where ETD₁, ETD₂ are exponential time differencing coefficients that
+    integrate the nonlinear term exactly for the linearized problem.
+    """
+    
+    def __init__(self, noise_amplitude: float = 0.0):
+        """
+        Initialize first-order dynamics.
+        
+        Args:
+            noise_amplitude: Strength of stochastic noise term η.
+                            Typical range: [0.0, 0.1]
+                            0.0 = deterministic dynamics
+                            >0 = fluctuating dynamics (finite temperature)
+                            Units: [field] / √[time]
+                            Default: 0.0 (no noise)
+                            
+        Example:
+            >>> # Deterministic dynamics (T=0)
+            >>> dynamics = FirstOrderDynamics(noise_amplitude=0.0)
+            >>> 
+            >>> # Thermal fluctuations (T>0)
+            >>> dynamics = FirstOrderDynamics(noise_amplitude=0.01)
+        """
+        self.noise_amplitude = noise_amplitude
+        self._config = {}
+    
+    @property
+    def order(self) -> int:
+        """
+        Time derivative order.
+        
+        Returns:
+            int: Always 1 for first-order dynamics (∂φ/∂t).
+                 Second-order would be 2 (∂²φ/∂t²).
+        """
+        return 1
+    
+    def compute_fields_next(
+        self,
+        fields: Dict[str, cp.ndarray],
+        dt: float,
+        operators,
+        model,
+        noise_fn: Optional[Callable] = None
+    ) -> Dict[str, cp.ndarray]:
+        """
+        Advance fields by one timestep using ETD predictor-corrector.
+        
+        This method implements the core time-stepping algorithm:
+        1. Compute linear coefficients from model parameters and k-space
+        2. Build ETD integration coefficients (exp, exp_nonlin, exp_nonlin2)
+        3. Predictor step: estimate φ(t+dt) using current N(φ)
+        4. Corrector step: refine using linearized dN/dt
+        5. Optional: iterate corrector if convergence is poor
+        
+        Args:
+            fields: Current density fields.
+                    Dictionary with 'phi' → CuPy array, shape (ny, nx).
+                    Typical phi range: [-0.8, 2.0] for log PFC.
+                    
+            dt: Timestep size.
+                Typical range: [1e-4, 1.0] depending on model stiffness.
+                Smaller dt → more stable, more expensive.
+                Larger dt → faster, risk of instability.
+                Units: [time] (arbitrary but consistent with parameters).
+                
+            operators: Operators instance providing k2, k4, k6 kernels.
+                      Must be SpectralOperators2D or compatible.
+                      Already configured with domain.
+                      
+            model: PFCModel instance providing functional_derivative().
+                   Must be LogPFCModel2D or compatible.
+                   Parameters (epsilon, beta, etc.) set at construction.
+                   
+            noise_fn: Optional callable that generates noise field.
+                     Signature: noise_fn() → CuPy array, shape (ny, nx).
+                     Called once per timestep if provided.
+                     If None and self.noise_amplitude > 0, backend generates noise.
+                     Default: None.
+                     
+        Returns:
+            dict: Updated fields at t + dt.
+                  Same structure as input: {'phi': phi_next}.
+                  phi_next has same shape and dtype as input phi.
+                  
+        Raises:
+            RuntimeError: If predictor-corrector fails to converge after 2 iterations.
+                         This usually indicates dt is too large or model is unstable.
+                         
+        Note:
+            The convergence check compares max(delta_phi) - min(delta_phi) to 0.01.
+            If this is exceeded, the corrector is re-evaluated once. If still
+            unconverged, an exception is raised.
+            
+        Example:
+            >>> # Single timestep
+            >>> fields_new = dynamics.compute_fields_next(
+            ...     fields={'phi': phi},
+            ...     dt=0.1,
+            ...     operators=operators,
+            ...     model=model
+            ... )
+            >>> phi_new = fields_new['phi']
+        """
+        phi = fields['phi']
+        
+        # Extract k-space kernels from operators (pre-computed by operators layer)
+        k2 = operators.k2  # Laplacian kernel: -k²
+        k4 = operators.k4  # Bilaplacian kernel: k⁴
+        k6 = operators.k6  # Sixth-order kernel: k⁶
+        
+        # Compute linear coefficient in k-space for this PFC model
+        # For log PFC: L̂(k) = -k²(ε+β) + 2β·k⁴ - β·k⁶
+        # This comes from Fourier transform of ∇²-based elastic energy
+        lincoeff = -k2 * (model.epsilon + model.beta) + 2 * model.beta * k4 - model.beta * k6
+        
+        # Build ETD coefficients for stable time integration
+        # exp_coeff = exp(L·dt): exact evolution of linear part
+        expcoeff = cp.exp(lincoeff * dt)
+        
+        # ETD coefficient for first-order nonlinear integration
+        # Exact integral: ∫₀ᵈᵗ exp(L·s) ds for constant N
+        # Formula: [exp(L·dt) - 1] / L for L≠0, or dt for L=0
+        expcoeff_nonlin = cp.ones_like(phi) * dt
+        expcoeff_nonlin[lincoeff != 0] = (
+            (expcoeff[lincoeff != 0] - 1) / lincoeff[lincoeff != 0]
+        )
+        
+        # ETD coefficient for second-order correction
+        # Exact integral: ∫₀ᵈᵗ (dt-s)·exp(L·s) ds for linear dN/dt
+        # Formula: [exp(L·dt) - (1 + L·dt)] / L² for L≠0
+        expcoeff_nonlin2 = cp.zeros_like(phi)
+        expcoeff_nonlin2[lincoeff != 0] = (
+            (expcoeff[lincoeff != 0] - (1 + lincoeff[lincoeff != 0] * dt)) /
+            cp.power(lincoeff[lincoeff != 0], 2)
+        )
+        
+        # Forward FFT of current field to k-space
+        phi_hat = cp.fft.fft2(phi)
+        
+        # Compute nonlinear functional derivative N(φ₀) at current time
+        # This is the "force" or "chemical potential" driving evolution
+        func_deriv = model.functional_derivative({'phi': phi})
+        N0 = func_deriv['phi']
+        
+        # Add noise to k-space nonlinear term if requested
+        # Noise is divergence-free and spectrally truncated via noise_fn
+        if noise_fn is not None:
+            noise = noise_fn()
+            noise_fft = cp.fft.fft2(noise)
+        else:
+            noise_fft = 0
+        
+        # Transform nonlinear term to k-space (with noise)
+        N0_hat = cp.fft.fft2(N0) + noise_fft
+        
+        # PREDICTOR STEP: estimate φ at t+dt using current N
+        # Formula: φ̂₁ = exp(L·dt)·φ̂₀ - k²·ETD₁·N̂₀
+        # The -k² factor comes from structure of PFC equations: ∂φ/∂t = ... -∇²N
+        phi_hat0 = expcoeff * phi_hat + (-k2 * expcoeff_nonlin * N0_hat)
+        phi0 = cp.fft.ifft2(phi_hat0).real
+        
+        # Compute time derivative of N using finite difference
+        # Approximate: dN/dt ≈ [N(φ₁) - N(φ₀)] / dt
+        func_deriv1 = model.functional_derivative({'phi': phi0})
+        N1 = func_deriv1['phi']
+        N1_hat = (cp.fft.fft2(N1) + noise_fft - N0_hat) / dt
+        
+        # CORRECTOR STEP: refine φ at t+dt using linearized dN/dt
+        # Formula: φ̂₁ = exp(L·dt)·φ̂₀ - k²·[ETD₁·N̂₀ + ETD₂·dN̂/dt]
+        phi_hat1 = expcoeff * phi_hat + (-k2 * (expcoeff_nonlin * N0_hat + expcoeff_nonlin2 * N1_hat))
+        phi1 = cp.fft.ifft2(phi_hat1).real
+        
+        # Check convergence of corrector step
+        # If phi changed significantly, re-evaluate N and iterate once
+        delta_phi = phi1 - phi0
+        if delta_phi.max() - delta_phi.min() > 0.01:
+            # Re-evaluate nonlinear term at corrected phi
+            phi0 = phi1
+            func_deriv1 = model.functional_derivative({'phi': phi0})
+            N1 = func_deriv1['phi']
+            N1_hat = (cp.fft.fft2(N1) + noise_fft - N0_hat) / dt
+            
+            # Recompute corrector
+            phi_hat1 = expcoeff * phi_hat + (-k2 * (expcoeff_nonlin * N0_hat + expcoeff_nonlin2 * N1_hat))
+            phi1 = cp.fft.ifft2(phi_hat1).real
+            
+            # Check convergence again; fail if still unconverged
+            delta_phi = phi1 - phi0
+            if delta_phi.max() - delta_phi.min() > 0.01:
+                raise RuntimeError(
+                    f"Predictor-corrector failed to converge. "
+                    f"delta_phi range: {delta_phi.min():.4f} to {delta_phi.max():.4f}. "
+                    f"Try reducing timestep dt={dt}."
+                )
+        
+        return {'phi': phi1}
+    
+    def compute_fields_velocity(
+        self,
+        fields: Dict[str, cp.ndarray],
+        operators,
+        model
+    ) -> Dict[str, cp.ndarray]:
+        """
+        Compute instantaneous time derivative ∂φ/∂t at current state.
+        
+        This is useful for diagnostics, visualization, or adaptive timestepping.
+        It evaluates the right-hand side of the evolution equation:
+            ∂φ/∂t = L(φ) + N(φ)
+        without advancing time.
+        
+        Args:
+            fields: Current density fields.
+                    Dictionary with 'phi' → CuPy array.
+                    
+            operators: Operators instance (provides k2, k4, k6).
+            
+            model: PFCModel instance (provides functional_derivative).
+            
+        Returns:
+            dict: Time derivatives.
+                  {'phi': ∂φ/∂t} with same shape as input phi.
+                  Units: [field] / [time].
+                  
+        Example:
+            >>> # Check if system is near equilibrium
+            >>> velocity = dynamics.compute_fields_velocity(fields, operators, model)
+            >>> dphi_dt = velocity['phi']
+            >>> max_velocity = cp.abs(dphi_dt).max()
+            >>> if max_velocity < 1e-6:
+            ...     print("System has equilibrated")
+        """
+        phi = fields['phi']
+        phi_hat = cp.fft.fft2(phi)
+        
+        k2 = operators.k2
+        k4 = operators.k4
+        k6 = operators.k6
+        
+        # Linear coefficient (same as in compute_fields_next)
+        lincoeff = -k2 * (model.epsilon + model.beta) + 2 * model.beta * k4 - model.beta * k6
+        
+        # Linear part of velocity: L(φ) = FFT⁻¹[lincoeff · φ̂]
+        linear_hat = lincoeff * phi_hat
+        linear_real = cp.fft.ifft2(linear_hat).real
+        
+        # Nonlinear part: -∇²N(φ)
+        func_deriv = model.functional_derivative({'phi': phi})
+        nonlinear = -k2 * func_deriv['phi']  # Apply -k² operator
+        
+        # Total velocity
+        velocity = linear_real + cp.fft.ifft2(cp.fft.fft2(nonlinear)).real
+        
+        return {'phi': velocity}
+```
+
+---
+
+## 5. Backend Layer
+
+### Purpose
+Backend manages device-specific memory (CPU vs GPU), executes timesteps, and generates
+noise. It provides a unified interface that hides hardware differences from the
+simulation layer.
+
+### Fully Commented Implementation
+
+```python
+from typing import Dict, Callable
+import numpy as np
+import cupy as cp
+
+class GPUBackend:
+    """
+    GPU backend using CuPy for hardware-accelerated PFC simulations.
+    
+    Responsibilities:
+    1. Manage GPU memory (allocate, transfer, free)
+    2. Execute timesteps (orchestrate model, dynamics, operators on GPU)
+    3. Generate noise (divergence-free, spectrally-truncated)
+    4. Safety checks (prevent numerical overflow)
+    
+    All field data is stored as CuPy arrays in GPU memory. Transfers to/from
+    CPU (NumPy) are explicit via to_numpy() and from_numpy().
+    """
+    
+    def __init__(self, max_phi: float = 5.0):
+        """
+        Initialize GPU backend.
+        
+        Args:
+            max_phi: Maximum allowed field value (safety threshold).
+                    If any field exceeds this, timestep raises RuntimeError.
+                    Prevents runaway growth due to numerical instability.
+                    Typical range: [3.0, 10.0]
+                    Default: 5.0
+                    
+        Example:
+            >>> backend = GPUBackend(max_phi=5.0)
+        """
+        self.max_phi = max_phi
+        self._config = {}
+    
+    @property
+    def device(self) -> str:
+        """
+        Device identifier.
+        
+        Returns:
+            str: Always 'gpu' for this backend.
+                 Alternative backends return 'cpu'.
+        """
+        return 'gpu'
+    
+    def initialize_fields(
+        self, 
+        domain, 
+        initial_conditions_fn: Callable
+    ) -> Dict[str, cp.ndarray]:
+        """
+        Initialize field arrays on GPU from initial conditions.
+        
+        This method:
+        1. Calls initial_conditions_fn to generate fields (possibly on CPU)
+        2. Transfers fields to GPU if needed
+        3. Returns dictionary of GPU arrays ready for timestepping
+        
+        Args:
+            domain: Domain instance (provides shape, dtype).
+                   Not directly used here; passed to initial_conditions_fn.
+                   
+            initial_conditions_fn: Callable that generates initial fields.
+                                  Signature: fn(domain) → {'phi': array, ...}
+                                  Arrays can be NumPy (CPU) or CuPy (GPU).
+                                  If NumPy, automatically transferred to GPU.
+                                  
+        Returns:
+            dict: Fields on GPU.
+                  Keys are field names (e.g., 'phi').
+                  Values are CuPy arrays with dtype float64.
+                  Shape matches domain.shape.
+                  
+        Example:
+            >>> ic = TriangularLattice(phi0=-0.35, seed=42)
+            >>> fields_gpu = backend.initialize_fields(domain, ic)
+            >>> print(type(fields_gpu['phi']))
+            <class 'cupy.ndarray'>
+        """
+        # Call IC function to generate fields (possibly on CPU)
+        fields_cpu = initial_conditions_fn(domain)
+        
+        # Transfer to GPU if needed
+        fields_gpu = {}
+        for name, arr in fields_cpu.items():
+            if isinstance(arr, np.ndarray):
+                # CPU array → transfer to GPU
+                fields_gpu[name] = cp.asarray(arr, dtype=cp.float64)
+            else:
+                # Already GPU array (CuPy)
+                fields_gpu[name] = arr
+        
+        return fields_gpu
+    
+    def timestep(
+        self,
+        fields: Dict[str, cp.ndarray],
+        dt: float,
+        model,
+        dynamics,
+        operators,
+        noise_amplitude: float = 0.0
+    ) -> Dict[str, cp.ndarray]:
+        """
+        Execute one timestep on GPU.
+        
+        This method orchestrates the time evolution:
+        1. Create noise generator if noise_amplitude > 0
+        2. Call dynamics.compute_fields_next() to advance time
+        3. Check safety threshold (max field value)
+        4. Return updated fields
+        
+        All operations occur on GPU for maximum performance.
+        
+        Args:
+            fields: Current fields on GPU.
+                   Dictionary: {'phi': CuPy array, ...}
+                   
+            dt: Timestep size.
+               Typical range: [1e-4, 1.0]
+               Units: [time]
+               
+            model: PFCModel instance (provides functional_derivative).
+            
+            dynamics: Dynamics instance (provides compute_fields_next).
+            
+            operators: Operators instance (provides k2, laplacian, etc.).
+            
+            noise_amplitude: Noise strength for stochastic dynamics.
+                            Typical range: [0.0, 0.1]
+                            0.0 = deterministic
+                            >0 = thermal fluctuations
+                            Default: 0.0
+                            
+        Returns:
+            dict: Updated fields at t + dt, on GPU.
+                  Same structure as input fields.
+                  
+        Raises:
+            RuntimeError: If any field exceeds self.max_phi.
+                         Indicates numerical instability; reduce dt.
+                         
+        Example:
+            >>> # Deterministic timestep
+            >>> fields_new = backend.timestep(
+            ...     fields, dt=0.1, model=model,
+            ...     dynamics=dynamics, operators=operators
+            ... )
+            >>> 
+            >>> # Stochastic timestep (with noise)
+            >>> fields_new = backend.timestep(
+            ...     fields, dt=0.1, model=model,
+            ...     dynamics=dynamics, operators=operators,
+            ...     noise_amplitude=0.01
+            ... )
+        """
+        # Create noise generator if requested
+        noise_fn = None
+        if noise_amplitude > 0:
+            def noise_fn():
+                return self._generate_noise(fields, operators, noise_amplitude)
+        
+        # Call dynamics to compute next state
+        # This delegates to FirstOrderDynamics.compute_fields_next()
+        fields_next = dynamics.compute_fields_next(
+            fields, dt, operators, model, noise_fn
+        )
+        
+        # Safety check: prevent runaway growth
+        for name, field in fields_next.items():
+            if cp.max(field) > self.max_phi:
+                raise RuntimeError(
+                    f"Field '{name}' exceeded max value {self.max_phi}. "
+                    f"Max value: {cp.max(field):.4f}. "
+                    f"Simulation is unstable; reduce timestep dt={dt}."
+                )
+        
+        return fields_next
+    
+    def _generate_noise(self, fields, operators, amplitude):
+        """
+        Generate divergence-free, spectrally-truncated noise.
+        
+        The noise is constructed to satisfy ∇·η = 0 (incompressible) and
+        have a high-frequency cutoff to prevent grid-scale instabilities.
+        
+        Construction:
+        1. Generate two random fields ηₓ, η_y (Gaussian white noise)
+        2. Compute ∇ηₓ + ∇η_y in Fourier space: i·kₓ·η̂ₓ + i·k_y·η̂_y
+        3. Set DC component to zero (∇·η = 0)
+        4. Apply spectral cutoff (remove |k| > k_cutoff)
+        5. Transform to real space and normalize to desired amplitude
+        
+        Args:
+            fields: Current fields (for shape information).
+            operators: Operators instance (provides kx, ky, k2).
+            amplitude: Desired noise amplitude (RMS value).
+                      Range: [0.0, 0.1] typically.
+                      
+        Returns:
+            CuPy array: Noise field, shape (ny, nx), dtype float64.
+                        Mean value = 0, RMS value = amplitude.
+                        Divergence-free and band-limited.
+                        
+        Note:
+            The noise cutoff wavenumber can be configured via:
+                backend.configure({'noise_cutoff_k': 0.5})
+            Default is 0.5, meaning noise is suppressed for |k| > 0.5.
+        """
+        phi = fields['phi']
+        ny, nx = phi.shape
+        
+        # Generate random Gaussian fields on GPU
+        # Mean=0, std=1 for each component
+        noisex = cp.random.normal(loc=0, scale=1, size=(ny, nx))
+        noisex_fft = 1j * operators._kx * cp.fft.fft2(noisex)
+        
+        noisey = cp.random.normal(loc=0, scale=1, size=(ny, nx))
+        noisey_fft = 1j * operators._ky * cp.fft.fft2(noisey)
+        
+        # Combine to ensure divergence-free: ∇·(∇ηₓ + ∇η_y) = 0 automatically
+        noise_fft = noisex_fft + noisey_fft
+        
+        # Remove DC component (zero mean)
+        noise_fft[0, 0] = 0
+        
+        # High-frequency cutoff to prevent grid-scale noise
+        # Default k_cutoff = 0.5 can be overridden in config
+        cutoff_k = self._config.get('noise_cutoff_k', 0.5)
+        noise_fft[operators.k2 > cutoff_k**2] = 0
+        
+        # Transform to real space
+        noise = cp.fft.ifft2(noise_fft).real
+        
+        # Normalize to desired RMS amplitude
+        # Current RMS: √⟨noise²⟩
+        # Target RMS: amplitude
+        # Scale factor: amplitude / current_rms
+        current_rms = cp.sqrt(cp.power(noise, 2).mean())
+        noise *= amplitude / current_rms
+        
+        return noise
+    
+    def to_numpy(self, fields: Dict[str, cp.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Transfer fields from GPU to CPU as NumPy arrays.
+        
+        Used for:
+        - Saving checkpoints to disk
+        - Visualization (e.g., matplotlib requires NumPy)
+        - Analysis with CPU-based libraries (scipy, scikit-image)
+        
+        Args:
+            fields: Fields on GPU (CuPy arrays).
+                   
+        Returns:
+            dict: Fields on CPU (NumPy arrays).
+                  Same keys and shapes, but dtype is NumPy.
+                  
+        Example:
+            >>> fields_cpu = backend.to_numpy(fields_gpu)
+            >>> phi_cpu = fields_cpu['phi']
+            >>> import matplotlib.pyplot as plt
+            >>> plt.imshow(phi_cpu)
+        """
+        fields_cpu = {}
+        for name, arr in fields.items():
+            if isinstance(arr, cp.ndarray):
+                # GPU → CPU transfer
+                fields_cpu[name] = cp.asnumpy(arr)
+            else:
+                # Already CPU
+                fields_cpu[name] = arr
+        return fields_cpu
+    
+    def from_numpy(self, fields_np: Dict[str, np.ndarray]) -> Dict[str, cp.ndarray]:
+        """
+        Transfer fields from CPU to GPU.
+        
+        Used for:
+        - Loading checkpoints from disk
+        - Initializing from externally-generated data
+        - Restarting simulations
+        
+        Args:
+            fields_np: Fields on CPU (NumPy arrays).
+                      
+        Returns:
+            dict: Fields on GPU (CuPy arrays, dtype float64).
+                  
+        Example:
+            >>> # Load checkpoint from disk
+            >>> data = np.load('checkpoint.npz')
+            >>> fields_cpu = {'phi': data['field_phi']}
+            >>> fields_gpu = backend.from_numpy(fields_cpu)
+        """
+        fields_gpu = {}
+        for name, arr in fields_np.items():
+            if isinstance(arr, np.ndarray):
+                # CPU → GPU transfer
+                fields_gpu[name] = cp.asarray(arr, dtype=cp.float64)
+            else:
+                # Already GPU
+                fields_gpu[name] = arr
+        return fields_gpu
+```
+
+---
+
+## 6. Simulation Layer
+
+### Purpose
+Simulation is the top-level orchestrator. It wires together all components (domain,
+model, dynamics, operators, backend, initial conditions) and runs the time loop.
+It handles checkpointing, progress reporting, and output without performing any
+numerical computations itself.
+
+### Fully Commented Implementation
+
+```python
+from typing import Optional, Callable
+import numpy as np
+
+class Simulation:
+    """
+    Main simulation runner for PFC models.
+    
+    Responsibilities:
+    1. Wire together all components (domain, model, dynamics, etc.)
+    2. Initialize fields from initial conditions
+    3. Run time loop (call backend.timestep repeatedly)
+    4. Save/load checkpoints for long runs
+    5. Report progress (energy, time, etc.)
+    6. Provide custom output hooks
+    
+    The simulation maintains state (current_step, current_time, fields) but
+    does NOT perform numerical operations. All computation is delegated to
+    backend, which calls dynamics, operators, and model.
+    """
+    
+    def __init__(
+        self,
+        domain,
+        model,
+        dynamics,
+        backend,
+        operators,
+        initial_conditions
+    ):
+        """
+        Initialize simulation by wiring all components together.
+        
+        This constructor:
+        1. Stores references to all components
+        2. Initializes fields via backend.initialize_fields()
+        3. Informs model of field shape via model.set_field_shape()
+        4. Sets initial state (step=0, time=0.0)
+        
+        Args:
+            domain: Domain instance defining spatial grid.
+                   Must be configured with shape, box_size, dtype, bc.
+                   Example: Domain(shape=(256, 256), box_size=(100.0, 100.0))
+                   
+            model: PFCModel instance defining physics.
+                  Must implement functional_derivative() and free_energy().
+                  Example: LogPFCModel2D(epsilon=-0.25, beta=1.0, ...)
+                  
+            dynamics: Dynamics instance defining time evolution.
+                     Must implement compute_fields_next().
+                     Example: FirstOrderDynamics(noise_amplitude=0.01)
+                     
+            backend: Backend instance managing computation.
+                    Must implement timestep(), to_numpy(), from_numpy().
+                    Example: GPUBackend(max_phi=5.0)
+                    
+            operators: Operators instance for spatial derivatives.
+                      Must be configured with domain before passing.
+                      Example:
+                          operators = SpectralOperators2D()
+                          operators.configure({'domain': domain})
+                          
+            initial_conditions: InitialConditions instance.
+                               Callable: ic(domain) → {'phi': array, ...}
+                               Example: TriangularLattice(phi0=-0.35, seed=42)
+                               
+        Example:
+            >>> # Assemble all components
+            >>> domain = Domain(shape=(256, 256), box_size=(100.0, 100.0))
+            >>> model = LogPFCModel2D(epsilon=-0.25, beta=1.0, g=0.0, v0=1.0,
+            ...                       Hln=1.0, Hng=0.5, phi0=-0.35)
+            >>> dynamics = FirstOrderDynamics(noise_amplitude=0.0)
+            >>> backend = GPUBackend(max_phi=5.0)
+            >>> operators = SpectralOperators2D()
+            >>> operators.configure({'domain': domain})
+            >>> ic = TriangularLattice(phi0=-0.35, seed=42)
+            >>> 
+            >>> # Create simulation
+            >>> sim = Simulation(domain, model, dynamics, backend, operators, ic)
+            >>> print(f"Initialized at t={sim.current_time}")
+            Initialized at t=0.0
+        """
+        # Store component references
+        self.domain = domain
+        self.model = model
+        self.dynamics = dynamics
+        self.backend = backend
+        self.operators = operators
+        self.initial_conditions = initial_conditions
+        
+        # Initialize fields on device (CPU or GPU depending on backend)
+        # Calls: IC(domain) → fields_cpu → backend → fields_device
+        self.fields = backend.initialize_fields(domain, initial_conditions)
+        
+        # Inform model of spatial dimensions
+        # Model may need this for temporary array allocation or validation
+        model.set_field_shape(domain.shape)
+        
+        # Initialize simulation state
+        self.current_step = 0      # Number of timesteps completed
+        self.current_time = 0.0    # Elapsed simulation time in arbitrary units
+    
+    def run(
+        self,
+        num_steps: int,
+        dt: float,
+        checkpoint_interval: int = 100,
+        output_fn: Optional[Callable] = None,
+        progress_fn: Optional[Callable] = None
+    ) -> None:
+        """
+        Run simulation time loop for specified number of steps.
+        
+        The main loop executes:
+        1. fields = backend.timestep(fields, dt, ...)  [advance one step]
+        2. Compute energy if progress_fn is provided
+        3. Save checkpoint if current_step % checkpoint_interval == 0
+        4. Call output_fn for custom output (e.g., save field snapshot)
+        5. Call progress_fn for diagnostics (e.g., print energy)
+        6. Increment current_step and current_time
+        
+        Args:
+            num_steps: Number of timesteps to execute.
+                      Typical range: [100, 1000000]
+                      For long runs, use checkpoints to avoid losing progress.
+                      
+            dt: Timestep size.
+               Typical range: [1e-4, 1.0] depending on model stiffness.
+               Units: [time] (arbitrary but consistent).
+               Smaller dt → more stable, more expensive.
+               Larger dt → faster, risk of instability.
+               
+            checkpoint_interval: Save checkpoint every N steps.
+                                Set to 0 to disable checkpointing.
+                                Typical values: 100, 1000, 10000.
+                                Files saved as "checkpoint_step_{step}.npz".
+                                Default: 100.
+                                
+            output_fn: Optional custom output callback.
+                      Signature: output_fn(step: int, fields: dict, time: float)
+                      Called every timestep with current state.
+                      Fields are transferred to CPU (NumPy) before passing.
+                      Use for: saving snapshots, plotting, analysis.
+                      Default: None (no custom output).
+                      
+            progress_fn: Optional progress reporting callback.
+                        Signature: progress_fn(step: int, time: float, energy: float)
+                        Called every timestep with step, time, and free energy.
+                        Energy computation requires transferring field to CPU.
+                        Use for: printing progress, logging metrics, monitoring.
+                        Default: None (silent run).
+                        
+        Example:
+            >>> # Simple run without output
+            >>> sim.run(num_steps=1000, dt=0.1)
+            >>> 
+            >>> # Run with progress reporting
+            >>> def report_progress(step, time, energy):
+            ...     if step % 100 == 0:
+            ...         print(f"Step {step:5d}, t={time:7.2f}, E={energy:12.6e}")
+            >>> sim.run(num_steps=1000, dt=0.1, progress_fn=report_progress)
+            >>> 
+            >>> # Run with custom output (save every 100 steps)
+            >>> def save_snapshot(step, fields, time):
+            ...     if step % 100 == 0:
+            ...         np.savez(f"snapshot_{step:06d}.npz", phi=fields['phi'], t=time)
+            >>> sim.run(num_steps=1000, dt=0.1, output_fn=save_snapshot)
+        """
+        for step in range(num_steps):
+            # TIMESTEP: advance fields from t to t+dt
+            # All numerical work happens inside backend.timestep()
+            self.fields = self.backend.timestep(
+                self.fields,
+                dt,
+                self.model,
+                self.dynamics,
+                self.operators
+            )
+            
+            # Update state counters
+            self.current_step += 1
+            self.current_time += dt
+            
+            # DIAGNOSTICS: compute free energy if needed for progress reporting
+            if progress_fn is not None:
+                # Transfer fields to CPU for energy calculation
+                fields_np = self.backend.to_numpy(self.fields)
+                
+                # Compute energy (requires mode_data for linear part)
+                # For now, compute without k-space data (nonlinear energy only)
+                energy = self.model.free_energy(fields_np)
+                
+                # Call user's progress function
+                progress_fn(self.current_step, self.current_time, energy)
+            
+            # CHECKPOINT: save state to disk for restart capability
+            if checkpoint_interval > 0 and self.current_step % checkpoint_interval == 0:
+                checkpoint_filename = f"checkpoint_step_{self.current_step}.npz"
+                self.save_checkpoint(checkpoint_filename)
+            
+            # CUSTOM OUTPUT: user-defined output hook (e.g., save field snapshot)
+            if output_fn is not None:
+                # Transfer fields to CPU for output
+                fields_np = self.backend.to_numpy(self.fields)
+                output_fn(self.current_step, fields_np, self.current_time)
+    
+    def load_checkpoint(self, filename: str) -> None:
+        """
+        Restore simulation state from checkpoint file.
+        
+        Loads fields and metadata (step, time) from a .npz file saved by
+        save_checkpoint(). After loading, simulation can continue from the
+        checkpoint state.
+        
+        Args:
+            filename: Path to checkpoint file.
+                     Must be .npz format created by save_checkpoint().
+                     Contains: field arrays + step + time.
+                     
+        Example:
+            >>> # Load checkpoint and continue simulation
+            >>> sim.load_checkpoint("checkpoint_step_1000.npz")
+            >>> print(f"Resumed from step {sim.current_step}, time {sim.current_time}")
+            >>> sim.run(num_steps=1000, dt=0.1)  # Continue for 1000 more steps
+        """
+        # Load data from compressed NumPy archive
+        data = np.load(filename, allow_pickle=True)
+        
+        # Extract field arrays (keys start with 'field_')
+        fields_np = {
+            key.replace('field_', ''): data[key]
+            for key in data.files
+            if key.startswith('field_')
+        }
+        
+        # Transfer fields from CPU to device (GPU or CPU depending on backend)
+        self.fields = self.backend.from_numpy(fields_np)
+        
+        # Restore metadata
+        self.current_step = int(data.get('step', 0))
+        self.current_time = float(data.get('time', 0.0))
+    
+    def save_checkpoint(self, filename: str) -> None:
+        """
+        Save current simulation state to checkpoint file.
+        
+        Creates a compressed .npz file containing:
+        - All field arrays (with 'field_' prefix)
+        - current_step
+        - current_time
+        
+        This checkpoint can be loaded via load_checkpoint() to restart.
+        
+        Args:
+            filename: Output path for checkpoint.
+                     Recommended format: "checkpoint_step_{step}.npz"
+                     Will be compressed with np.savez_compressed.
+                     
+        Example:
+            >>> # Manual checkpoint
+            >>> sim.save_checkpoint("my_checkpoint.npz")
+            >>> 
+            >>> # Automatic checkpoints via run()
+            >>> sim.run(num_steps=10000, dt=0.1, checkpoint_interval=1000)
+            >>> # Creates: checkpoint_step_1000.npz, checkpoint_step_2000.npz, ...
+        """
+        # Transfer fields from device to CPU for saving
+        fields_np = self.backend.to_numpy(self.fields)
+        
+        # Build save dictionary with field_ prefix for field arrays
+        save_dict = {
+            f'field_{name}': arr
+            for name, arr in fields_np.items()
+        }
+        
+        # Add metadata
+        save_dict['step'] = self.current_step
+        save_dict['time'] = self.current_time
+        
+        # Save as compressed NumPy archive
+        np.savez_compressed(filename, **save_dict)
+```
+
+---
+
+## Usage Examples
+
+### Example 1: Basic Simulation Setup
+
+```python
+"""
+Minimal example: run a 2D log PFC simulation with triangular lattice IC.
+"""
+
+import numpy as np
+import sys
+sys.path.append('path/to/pfc-general')
+
+from simulation import Domain, Simulation, TriangularLattice
+from models.free_energy import LogPFCModel2D
+from dynamics import FirstOrderDynamics
+from operators import SpectralOperators2D
+from backends.gpu_kernels import GPUBackend
+
+# 1. DEFINE DOMAIN
+# 256x256 grid, 100x100 physical size, periodic boundaries
+domain = Domain(
+    shape=(256, 256),
+    box_size=(100.0, 100.0),
+    dtype=np.float64,
+    bc='periodic'
+)
+
+# 2. CREATE MODEL
+# Log PFC with standard parameters for crystallization
+model = LogPFCModel2D(
+    epsilon=-0.25,   # Below critical temperature (favors crystal)
+    beta=1.0,        # Elastic constant
+    g=0.0,           # No cubic asymmetry
+    v0=1.0,          # Quartic interaction
+    Hln=1.0,         # Logarithmic penalty
+    Hng=0.5,         # Vacancy cost
+    phi0=-0.35       # Average density (crystal state)
+)
+
+# 3. CREATE OPERATORS
+# Spectral (FFT-based) for periodic BC
+operators = SpectralOperators2D()
+operators.configure({'domain': domain})
+
+# 4. CREATE DYNAMICS
+# First-order, deterministic (no noise)
+dynamics = FirstOrderDynamics(noise_amplitude=0.0)
+
+# 5. CREATE BACKEND
+# GPU backend with safety threshold
+backend = GPUBackend(max_phi=5.0)
+
+# 6. CREATE INITIAL CONDITIONS
+# Triangular lattice with small noise
+ic = TriangularLattice(
+    phi0=-0.35,           # Average density
+    amplitude=None,       # Auto: phi0 / 3
+    noise_amplitude=0.01, # Small thermal fluctuations
+    seed=42               # Reproducible
+)
+
+# 7. ASSEMBLE SIMULATION
+sim = Simulation(
+    domain=domain,
+    model=model,
+    dynamics=dynamics,
+    backend=backend,
+    operators=operators,
+    initial_conditions=ic
+)
+
+# 8. RUN SIMULATION
+# Simple run without output
+sim.run(num_steps=1000, dt=0.1)
+
+print(f"Final time: {sim.current_time:.1f}")
+print(f"Final step: {sim.current_step}")
+```
+
+### Example 2: Simulation with Progress Monitoring
+
+```python
+"""
+Monitor energy evolution during simulation.
+"""
+
+# Define progress callback
+def monitor_progress(step, time, energy):
+    """
+    Print progress every 100 steps.
+    
+    Args:
+        step: Current timestep number
+        time: Elapsed simulation time
+        energy: Free energy per site
+    """
+    if step % 100 == 0:
+        print(f"Step {step:6d} | Time {time:8.2f} | Energy {energy:14.8e}")
+
+# Run with progress monitoring
+sim.run(
+    num_steps=5000,
+    dt=0.1,
+    progress_fn=monitor_progress
+)
+
+# Output:
+# Step    100 | Time    10.00 | Energy -1.23456789e-03
+# Step    200 | Time    20.00 | Energy -1.24567890e-03
+# ...
+```
+
+### Example 3: Checkpoint and Restart
+
+```python
+"""
+Long run with automatic checkpointing and restart capability.
+"""
+
+# Initial run: 10000 steps with checkpoints every 1000
+sim.run(
+    num_steps=10000,
+    dt=0.1,
+    checkpoint_interval=1000
+)
+# Creates: checkpoint_step_1000.npz, ..., checkpoint_step_10000.npz
+
+# Later: restart from checkpoint and continue
+sim2 = Simulation(domain, model, dynamics, backend, operators, ic)
+sim2.load_checkpoint("checkpoint_step_5000.npz")
+print(f"Restarted from step {sim2.current_step}, time {sim2.current_time}")
+
+# Continue for 5000 more steps
+sim2.run(num_steps=5000, dt=0.1)
+print(f"Final step: {sim2.current_step}")  # Should be 10000
+```
+
+### Example 4: Custom Output
+
+```python
+"""
+Save field snapshots during simulation.
+"""
+
+import matplotlib.pyplot as plt
+
+def save_snapshots(step, fields, time):
+    """
+    Save field visualization every 500 steps.
+    
+    Args:
+        step: Current timestep
+        fields: Dictionary of fields on CPU (NumPy arrays)
+        time: Current simulation time
+    """
+    if step % 500 == 0:
+        phi = fields['phi']
+        
+        # Create plot
+        plt.figure(figsize=(8, 6))
+        plt.imshow(phi, cmap='RdBu_r', origin='lower')
+        plt.colorbar(label='φ (density)')
+        plt.title(f'Density Field at t = {time:.1f} (step {step})')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        
+        # Save to file
+        plt.savefig(f'snapshot_step_{step:06d}.png', dpi=150)
+        plt.close()
+        
+        # Also save raw data
+        np.savez_compressed(f'data_step_{step:06d}.npz', phi=phi, time=time)
+
+# Run with custom output
+sim.run(
+    num_steps=5000,
+    dt=0.1,
+    output_fn=save_snapshots
+)
+```
+
+### Example 5: Stochastic Dynamics
+
+```python
+"""
+Run with thermal noise (finite temperature simulation).
+"""
+
+# Create dynamics with noise
+dynamics_noisy = FirstOrderDynamics(noise_amplitude=0.02)
+
+# Backend configuration for noise cutoff
+backend_noisy = GPUBackend(max_phi=5.0)
+backend_noisy.configure({'noise_cutoff_k': 0.5})
+
+# Assemble simulation
+sim_stochastic = Simulation(
+    domain, model, dynamics_noisy, backend_noisy, operators, ic
+)
+
+# Run stochastic simulation
+sim_stochastic.run(num_steps=10000, dt=0.05)  # Smaller dt for stability
+```
+
+---
+
+## Summary
+
+This documentation covers the complete refactored PFC library with:
+
+1. **Domain** - Spatial grid metadata (shape, spacing, wavenumbers)
+2. **Model** - Physics (free energy, functional derivatives)
+3. **Operators** - Spatial derivatives (Laplacian, gradient via FFT)
+4. **Dynamics** - Time evolution (ETD predictor-corrector)
+5. **Backend** - GPU execution (memory management, noise generation)
+6. **Simulation** - Orchestration (time loop, checkpoints, output)
+
+Each component has:
+- Full docstrings with parameter descriptions
+- Value ranges and units
+- Usage examples
+- Safety checks and error handling
+
+This modular architecture enables:
+- Easy testing (each component isolated)
+- Extensibility (swap operators, models, backends)
+- Reusability (same dynamics for different models)
+- Clarity (single responsibility per class)
