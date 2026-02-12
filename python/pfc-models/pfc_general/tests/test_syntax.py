@@ -9,6 +9,13 @@ import pytest
 import sys
 from pathlib import Path
 
+# Check if cupy is available
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except (ImportError, Exception):
+    CUPY_AVAILABLE = False
+
 # Add parent directory to path for imports
 test_dir = Path(__file__).parent
 pfc_general_dir = test_dir.parent
@@ -28,6 +35,7 @@ def test_import_base_model():
     assert PFCModel is not None
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_import_log_model():
     """Test importing LogPFCModel2D."""
     from pfc_general.models.free_energy.log import LogPFCModel2D
@@ -40,6 +48,7 @@ def test_import_base_operators():
     assert Operators is not None
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_import_spectral_operators():
     """Test importing SpectralOperators2D."""
     from pfc_general.operators.spectral_ops import SpectralOperators2D
@@ -52,6 +61,7 @@ def test_import_base_dynamics():
     assert Dynamics is not None
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_import_first_order_dynamics():
     """Test importing FirstOrderDynamics."""
     from pfc_general.dynamics.first_order import FirstOrderDynamics
@@ -64,12 +74,14 @@ def test_import_base_backend():
     assert Backend is not None
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_import_gpu_backend():
     """Test importing GPUBackend."""
     from pfc_general.backends.gpu_kernels.backend import GPUBackend
     assert GPUBackend is not None
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_import_ics():
     """Test importing initial condition classes."""
     from pfc_general.simulation.ics import FlatNoisy, TriangularLattice
@@ -77,6 +89,7 @@ def test_import_ics():
     assert TriangularLattice is not None
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_import_simulation():
     """Test importing Simulation class."""
     from pfc_general.simulation import Simulation
@@ -94,6 +107,7 @@ def test_domain_instantiation():
     assert domain.box_size == (10.0, 10.0)
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_log_model_instantiation():
     """Test creating LogPFCModel2D instance."""
     from pfc_general.models.free_energy.log import LogPFCModel2D
@@ -111,6 +125,7 @@ def test_log_model_instantiation():
     assert model.num_fields == 1
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_spectral_operators_instantiation():
     """Test creating SpectralOperators2D instance."""
     from pfc_general.operators.spectral_ops import SpectralOperators2D
@@ -120,6 +135,7 @@ def test_spectral_operators_instantiation():
     assert ops.method == 'spectral'
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_first_order_dynamics_instantiation():
     """Test creating FirstOrderDynamics instance."""
     from pfc_general.dynamics.first_order import FirstOrderDynamics
@@ -130,6 +146,7 @@ def test_first_order_dynamics_instantiation():
     assert dynamics.noise_amplitude == 0.01
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_gpu_backend_instantiation():
     """Test creating GPUBackend instance."""
     from pfc_general.backends.gpu_kernels.backend import GPUBackend
@@ -139,6 +156,7 @@ def test_gpu_backend_instantiation():
     assert backend.device == 'gpu'
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_flat_noisy_instantiation():
     """Test creating FlatNoisy IC."""
     from pfc_general.simulation.ics import FlatNoisy
@@ -148,6 +166,7 @@ def test_flat_noisy_instantiation():
     assert callable(ic)
 
 
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy not available")
 def test_triangular_lattice_instantiation():
     """Test creating TriangularLattice IC."""
     from pfc_general.simulation.ics import TriangularLattice

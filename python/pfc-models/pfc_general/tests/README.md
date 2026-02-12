@@ -6,6 +6,8 @@ This directory contains pytest tests for the PFC General library.
 
 - **test_syntax.py**: Import and instantiation tests (no GPU required)
 - **test_core.py**: Full functionality tests (requires CuPy/GPU)
+- **test_backends.py**: Backend API and CPU numerical accuracy tests
+- **test_gpu_kernel_backend.py**: GPU kernel backend tests (requires CuPy/GPU)
 - **conftest.py**: Shared fixtures for all tests
 
 ## Running Tests
@@ -25,6 +27,16 @@ pytest test_syntax.py -v
 pytest test_core.py -v
 ```
 
+### GPU Kernel Tests (requires GPU)
+```bash
+pytest test_gpu_kernel_backend.py -v
+```
+
+### Backend Tests (CPU only)
+```bash
+pytest test_backends.py -v
+```
+
 ### With Coverage
 ```bash
 pytest --cov=../ --cov-report=html
@@ -38,10 +50,17 @@ The test suite covers:
 2. **LogPFCModel2D**: Free energy, functional derivative, parameter validation
 3. **SpectralOperators2D**: Laplacian, gradient, bilaplacian
 4. **FirstOrderDynamics**: ETD timestep, predictor-corrector
-5. **GPUBackend**: Array allocation, CPU↔GPU transfer, noise generation
-6. **Initial Conditions**: FlatNoisy, TriangularLattice
-7. **Simulation**: Full workflow, checkpoints
-8. **Integration**: End-to-end simulation runs
+5. **CPUBackend**: CPU field initialization, dtype conversion, accuracy checks
+6. **GPUBackend**: Array allocation, CPU↔GPU transfer, noise generation
+7. **Initial Conditions**: FlatNoisy, TriangularLattice
+8. **Simulation**: Full workflow, checkpoints
+9. **Integration**: End-to-end simulation runs
+
+## GPU Availability
+
+GPU test files are skipped automatically when CuPy is unavailable. When CuPy
+is installed and compatible with the active NumPy version, all GPU tests run
+normally.
 
 ## Fixtures
 

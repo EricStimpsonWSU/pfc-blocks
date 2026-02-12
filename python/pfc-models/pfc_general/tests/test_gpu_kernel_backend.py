@@ -5,19 +5,33 @@ using CuPy, with support for Log PFC and variants.
 """
 
 import numpy as np
-import cupy as cp
 import pytest
 from pathlib import Path
 
-import sys
-pfc_models_path = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(pfc_models_path))
+# Try to import cupy, skip all tests if not available
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except (ImportError, Exception) as e:
+    cp = None
+    CUPY_AVAILABLE = False
+    pytestmark = pytest.mark.skip(reason=f"CuPy not available: {e}")
+    # Create dummy classes to allow module to load
+    class GPUBackendPBC2DKernel: pass
+    class LogPFCModel2D: pass
+    class SpectralOperators2D: pass
+    class Domain: pass
+    class FirstOrderDynamics: pass
+else:
+    import sys
+    pfc_models_path = Path(__file__).parent.parent.parent
+    sys.path.insert(0, str(pfc_models_path))
 
-from pfc_general.backends import GPUBackendPBC2DKernel
-from pfc_general.models.free_energy.log import LogPFCModel2D
-from pfc_general.operators.spectral_ops import SpectralOperators2D
-from pfc_general.simulation.domain import Domain
-from pfc_general.dynamics.first_order import FirstOrderDynamics
+    from pfc_general.backends import GPUBackendPBC2DKernel
+    from pfc_general.models.free_energy.log import LogPFCModel2D
+    from pfc_general.operators.spectral_ops import SpectralOperators2D
+    from pfc_general.simulation.domain import Domain
+    from pfc_general.dynamics.first_order import FirstOrderDynamics
 
 
 @pytest.mark.gpu

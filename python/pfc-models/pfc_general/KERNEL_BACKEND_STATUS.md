@@ -4,7 +4,7 @@
 
 ## Overview
 
-The `GPUBackendPBC2DKernel` specialized GPU backend for 2D PBC systems provides optimized nonlinear term computation via CuPy. The implementation is numerically verified to match vanilla computation exactly.
+The `GPUBackendPBC2DKernel` specialized GPU backend for 2D PBC systems provides optimized nonlinear term computation via CuPy. The implementation is numerically verified to match vanilla computation exactly. A NumPy-based CPU backend is also available for CPU-only workflows.
 
 ## Current Status
 
@@ -30,7 +30,7 @@ Model.functional_derivative() [pure CuPy operations]
 
 ## Testing
 
-All tests pass with full numeric verification:
+All tests pass with full numeric verification. GPU tests run when CuPy is available:
 - ✅ 7/7 GPU kernel backend tests pass
 - ✅ 24/24 core tests pass  
 - ✅ Kernel matches vanilla computation (zero discrepancy)

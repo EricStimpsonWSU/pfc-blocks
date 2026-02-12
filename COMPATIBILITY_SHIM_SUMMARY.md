@@ -52,6 +52,12 @@ from pfc_general.compatibility import PFC2D_Vacancy
 sim = PFC2D_Vacancy()
 ```
 
+## CPU Backend Availability
+
+The refactored library includes a NumPy-based CPU backend (`CPUBackend`) that
+does not require CuPy. GPU backends are imported lazily and only load CuPy when
+explicitly referenced, keeping CPU-only workflows lightweight.
+
 ## Mathematical Equivalence Validated
 
 All 6 major components preserve exact mathematical equivalence:

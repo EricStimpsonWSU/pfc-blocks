@@ -58,8 +58,8 @@ Key changes:
 - Receives operators and model as dependencies
 - Separated noise handling
 
-### 4. Backend Layer → `backends/gpu_kernels/backend.py`
-**Class: `GPUBackend`**
+### 4. Backend Layer → `backends/`
+**Classes: `CPUBackend`, `GPUBackend`**
 
 Maps from PFC2D_Vacancy:
 - GPU array management (`cp.zeros`, etc.)
@@ -67,9 +67,11 @@ Maps from PFC2D_Vacancy:
 - Data transfer (implicit in original)
 
 Key changes:
-- Owns GPU memory and data layout
-- Orchestrates model/dynamics/operators on device
-- Clean CPU ↔ GPU interface
+- CPU backend (`backends/cpu/backend.py`) provides a NumPy-only path for CPU
+  execution and testing.
+- GPU backend (`backends/gpu_kernels/backend.py`) owns GPU memory and data
+  layout and orchestrates model/dynamics/operators on device.
+- Clean CPU ↔ GPU interface with consistent `Backend` API.
 
 ### 5. Domain Layer → `simulation/domain.py`
 **Class: `Domain`**
@@ -145,11 +147,13 @@ for i in range(1000):
 
 ### Refactored (PFC General)
 ```python
+from pfc_general.backends import CPUBackend, GPUBackend
+
 domain = Domain(shape=(256, 256), box_size=(Lx, Ly))
 model = LogPFCModel2D(epsilon=-0.25, beta=1.0, ...)
 operators = SpectralOperators2D()
 dynamics = FirstOrderDynamics()
-backend = GPUBackend()
+backend = CPUBackend()  # or GPUBackend() when CuPy/CUDA are available
 ic = TriangularLattice(phi0=-0.35)
 
 operators.configure({'domain': domain})

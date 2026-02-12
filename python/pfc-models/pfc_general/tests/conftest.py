@@ -4,9 +4,16 @@ Pytest configuration and shared fixtures for PFC General tests.
 
 import pytest
 import numpy as np
-import cupy as cp
 import sys
 from pathlib import Path
+
+# Try to import cupy if available (optional for CPU-only tests)
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    CUPY_AVAILABLE = False
 
 # Add parent directory to path for imports
 test_dir = Path(__file__).parent

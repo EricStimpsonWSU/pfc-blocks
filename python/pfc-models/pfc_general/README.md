@@ -21,8 +21,9 @@ A refactored phase field crystal (PFC) simulation library with clean separation 
 
 - **backends/** - Computational backends
   - `base_backend.py` - Abstract Backend interface
-  - `cpu_numba/` - CPU implementation with Numba JIT
-  - `gpu_kernels/` - GPU implementation with custom kernels
+  - `cpu/` - CPU backend (NumPy)
+  - `cpu_numba/` - CPU implementation with Numba JIT (experimental)
+  - `gpu_kernels/` - GPU implementation with custom kernels (CuPy)
 
 - **simulation/** - Simulation orchestration
   - `domain.py` - Spatial grid and boundary conditions
@@ -64,5 +65,19 @@ pip install -e .
 
 ```python
 from pfc_general import Domain, Simulation
+from pfc_general.backends import CPUBackend
+
 # ... (example to be added after Milestone 1)
+```
+
+## Backend Selection
+
+CPU-only usage does not require CuPy. GPU backends are imported lazily and only
+load CuPy when explicitly referenced.
+
+```python
+from pfc_general.backends import CPUBackend, GPUBackendPBC2DKernel
+
+cpu_backend = CPUBackend()
+# gpu_backend = GPUBackendPBC2DKernel()  # Requires CuPy/CUDA
 ```

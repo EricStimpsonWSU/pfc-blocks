@@ -6,9 +6,17 @@ Run with: pytest test_core.py -v
 
 import pytest
 import numpy as np
-import cupy as cp
 import sys
 from pathlib import Path
+
+# Try to import cupy, skip all tests if not available
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except (ImportError, Exception) as e:
+    cp = None
+    CUPY_AVAILABLE = False
+    pytestmark = pytest.mark.skip(reason=f"CuPy not available: {e}")
 
 # Add parent directory to path for imports
 test_dir = Path(__file__).parent
