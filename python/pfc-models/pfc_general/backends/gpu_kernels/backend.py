@@ -83,9 +83,9 @@ class GPUBackend(Backend):
             def noise_fn():
                 return self._generate_noise(fields, operators, noise_amplitude)
         
-        # Call dynamics to compute next fields
+        # Call dynamics to compute next fields, passing self as backend
         fields_next = dynamics.compute_fields_next(
-            fields, dt, operators, model, noise_fn
+            fields, dt, operators, model, noise_fn, backend=self
         )
         
         # Safety check

@@ -84,6 +84,35 @@ class Backend(ABC):
         """Transfer fields from numpy (CPU) to device."""
         pass
     
+    def nonlinear_term(
+        self,
+        fields: Dict[str, np.ndarray],
+        model: 'PFCModel',
+        operators: 'Operators'
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute nonlinear term N(phi) using backend-specific implementation.
+        
+        This method can be overridden by specialized backends to use custom kernels
+        (CuPy RawKernel, Numba, etc.) optimized for specific model configurations.
+        
+        Default behavior delegates to model.functional_derivative().
+        
+        Args:
+            fields: dict of device arrays (e.g., {'phi': array})
+            model: PFCModel instance with parameters
+            operators: Operators instance (may contain k-space coefficients)
+        
+        Returns:
+            dict of nonlinear terms in same layout as fields (e.g., {'phi': N_array})
+        
+        Note:
+            Some specialized backends may precompute auxiliary tables (phi2, phi3, etc.)
+            accessible via self._buffer dict for debugging or energy calculations.
+        """
+        # Default: delegate to model
+        return model.functional_derivative(fields)
+    
     def configure(self, config: Dict) -> None:
         """Accept backend-specific settings (thread count, memory limits, etc.)."""
         self._config = config

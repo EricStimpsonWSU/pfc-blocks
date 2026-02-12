@@ -32,7 +32,8 @@ class FirstOrderDynamics(Dynamics):
         dt: float,
         operators,
         model,
-        noise_fn: Optional[Callable] = None
+        noise_fn: Optional[Callable] = None,
+        backend = None
     ) -> Dict[str, cp.ndarray]:
         """
         Compute next timestep using predictor-corrector with ETD.
@@ -47,6 +48,8 @@ class FirstOrderDynamics(Dynamics):
             operators: SpectralOperators2D instance with k2, k4, k6
             model: LogPFCModel2D instance
             noise_fn: optional noise generator
+            backend: optional Backend instance; if provided, uses backend.nonlinear_term()
+                     instead of model.functional_derivative() for custom kernel support
         
         Returns:
             dict with updated 'phi' field
@@ -79,9 +82,13 @@ class FirstOrderDynamics(Dynamics):
         # FFT of current field
         phi_hat = cp.fft.fft2(phi)
         
-        # Compute nonlinear term N0
-        func_deriv = model.functional_derivative({'phi': phi})
-        N0 = func_deriv['phi']
+        # Compute nonlinear term N0 using backend hook if available, else model
+        if backend is not None and backend.nonlinear_term is not None:
+            N0_dict = backend.nonlinear_term(fields, model, operators)
+            N0 = N0_dict['phi']
+        else:
+            func_deriv = model.functional_derivative({'phi': phi})
+            N0 = func_deriv['phi']
         
         # Add noise if requested
         if noise_fn is not None:
@@ -97,8 +104,12 @@ class FirstOrderDynamics(Dynamics):
         phi0 = cp.fft.ifft2(phi_hat0).real
         
         # Compute N1 (time derivative of nonlinear term)
-        func_deriv1 = model.functional_derivative({'phi': phi0})
-        N1 = func_deriv1['phi']
+        if backend is not None and backend.nonlinear_term is not None:
+            N1_dict = backend.nonlinear_term({'phi': phi0}, model, operators)
+            N1 = N1_dict['phi']
+        else:
+            func_deriv1 = model.functional_derivative({'phi': phi0})
+            N1 = func_deriv1['phi']
         N1_hat = (cp.fft.fft2(N1) + noise_fft - N0_hat) / dt
         
         # Corrector step
@@ -110,8 +121,12 @@ class FirstOrderDynamics(Dynamics):
         if delta_phi.max() - delta_phi.min() > 0.01:
             # Refine corrector
             phi0 = phi1
-            func_deriv1 = model.functional_derivative({'phi': phi0})
-            N1 = func_deriv1['phi']
+            if backend is not None and backend.nonlinear_term is not None:
+                N1_dict = backend.nonlinear_term({'phi': phi0}, model, operators)
+                N1 = N1_dict['phi']
+            else:
+                func_deriv1 = model.functional_derivative({'phi': phi0})
+                N1 = func_deriv1['phi']
             N1_hat = (cp.fft.fft2(N1) + noise_fft - N0_hat) / dt
             
             phi_hat1 = expcoeff * phi_hat + (-k2 * (expcoeff_nonlin * N0_hat + expcoeff_nonlin2 * N1_hat))
